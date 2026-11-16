@@ -8,12 +8,13 @@
 **waypoints** is a [Windower 4](https://www.windower.net/) addon for Final Fantasy XI. You
 record where you walk, and it builds a **graph of walkable routes** for each zone. You name
 places on it, and `//wp go <place>` walks you there along the **shortest recorded path** (A*).
-It opens closed doors on the way and **routes around blocked paths**.
+It **steers around obstacles**, opens closed doors on the way, and **reroutes** when a path is
+blocked.
 
 Windower gives addons no map or collision data, so nothing is guessed: every route the addon
 uses is one you walked.
 
-> **Status: 0.2.0, untested in game.** The logic is covered by 62 offline tests (CI runs
+> **Status: 0.3.0, untested in game.** The logic is covered by 74 offline tests (CI runs
 > them on every push), but it has not yet been run on a live client. See
 > [Verifying in game](#verifying-in-game) before relying on it.
 
@@ -41,9 +42,11 @@ uses is one you walked.
   recorded on different days combine into one graph per zone.
 - **Named places.** `//wp mark ah`, `//wp mark mog`, `//wp marks`.
 - **Shortest-path walking.** A* over the graph, steered with `windower.ffxi.run`.
+- **Obstacle avoidance.** When something stops you, it probes headings to either side,
+  slides along the obstacle's edge, and rejoins the route once the way is clear.
 - **Doors.** It opens closed doors on the path before you reach them, and remembers doors
   you opened by hand while recording.
-- **Blocked-path detection.** When the walk stops making progress, it:
+- **Blocked-path detection.** When avoidance finds no way past, it:
   1. tries to open a nearby door,
   2. then marks that stretch blocked and reroutes over another recorded route,
   3. then stops and tells you where.
@@ -125,7 +128,7 @@ the game. `waypoints.lua` connects them to Windower.
 |---|---|
 | `graph.lua` | Nodes, edges, marks and recorded doors; nearest-node lookup; A* (binary heap) that can skip blocked edges; serialization |
 | `recorder.lua` | Turns a stream of positions into nodes and edges |
-| `navigator.lua` | Follows a list of points; reports arrival, being stuck or leaving the route |
+| `navigator.lua` | Follows a list of points, steering around obstacles; reports arrival, being stuck or leaving the route |
 | `doors.lua` | Which entities are doors, whether they're open, and which one is in the way |
 | `waypoints.lua` | Commands, events, steering, door packets, rerouting, storage, overlay |
 
@@ -152,8 +155,32 @@ the game. `waypoints.lua` connects them to Windower.
   - you press Escape or type `//wp stop`,
   - you are engaged, dead or zoning,
   - you are more than 12 yalms off the route,
-  - you are blocked with no way around (below).
+  - you are blocked with no way around (see [Obstacles](#obstacles) and
+    [Blocked paths](#blocked-paths)).
 - Cutscenes, menus, resting and other statuses pause it, and it continues afterwards.
+
+### Obstacles
+
+There's no collision data, so an obstacle is only noticed by its effect. If you move less
+than 0.6 yalms in 0.6 seconds while running, you are blocked. The walker then:
+
+1. **Checks for a door.** If a closed door is close by, it opens that instead (see
+   [Doors](#doors)).
+2. **Probes.** It tries headings turned 45°, 90° and 135° off the direct line, alternating
+   sides and starting with the side that worked last. Each gets 0.6 s. The angles are
+   measured from the direction at the moment you were blocked, so sliding along the
+   obstacle doesn't turn you back into it.
+3. **Slides.** As soon as one heading makes progress, it tries the direct line again. If
+   that's still blocked, it takes the working heading for another 0.6 s and tries again.
+   This follows the obstacle's edge until the way is clear, then rejoins the route.
+4. **Switches sides.** Straying more than 8 yalms from the route switches to the other side
+   once.
+5. **Gives up** as "stuck" when every heading is blocked, when both sides run out of room,
+   or after 12 seconds of avoiding on one stretch. The [Blocked paths](#blocked-paths)
+   steps then take over.
+
+`nav.avoid = false` turns this off. The walker then waits 3 seconds without progress before
+treating the path as blocked.
 
 ### Doors
 
@@ -169,12 +196,14 @@ the game. `waypoints.lua` connects them to Windower.
 
 ### Blocked paths
 
-When you move less than 1 yalm in 3 seconds:
+When obstacle avoidance gives up (or, with avoidance off, after 3 seconds without progress):
 
 1. **Door.** If a closed door is close by, the walker stops, opens it, and waits up to
    4 seconds for it to open. It tries each door twice.
 2. **Reroute.** Otherwise it marks the stretch of route it was on as blocked for 10 minutes
-   and plans a new route from where you are, avoiding blocked stretches.
+   and plans a new route avoiding blocked stretches. The new route starts from the last
+   node passed, which is known to be reachable; the nearest node might be on the far side
+   of the obstacle.
 3. **Give up.** With no other recorded route, or after 3 reroutes, it stops and says where.
 
 `//wp blocked` lists the blocked stretches. They are kept in memory only and are cleared
@@ -195,7 +224,13 @@ it while the addon is unloaded, or run `//lua reload waypoints` afterwards.
 | `record.jump` | 20.0 | Distance between samples treated as a warp |
 | `nav.tolerance` | 1.5 | Distance at which a point counts as reached |
 | `nav.final_tolerance` | 1.0 | The same, for the destination |
-| `nav.stuck_seconds` | 3.0 | Window for the stuck check |
+| `nav.avoid` | true | Steer around obstacles |
+| `nav.blocked_seconds` | 0.6 | Window for noticing an obstacle, and for each probe |
+| `nav.blocked_distance` | 0.6 | Movement in that window below which you're blocked |
+| `nav.commit_seconds` | 0.6 | How long to keep a working heading before retrying the direct line |
+| `nav.avoid_radius` | 8.0 | How far from the route avoidance may go (per side) |
+| `nav.avoid_max` | 12.0 | Seconds of avoiding allowed per stretch |
+| `nav.stuck_seconds` | 3.0 | Stuck window when avoidance is off |
 | `nav.stuck_distance` | 1.0 | Minimum movement in that window |
 | `nav.off_route` | 12.0 | Distance from the route that stops the walk |
 | `nav.snap_radius` | 8.0 | How far the nearest recorded node may be when starting |
@@ -241,8 +276,11 @@ return {
     edge. Run `//wp undo` straight away, or lower `record.merge_radius`.
   - Steep stairs and ramps can fall outside the 3-yalm height window. Walk them in one go so
     the nodes connect.
-- **Blocked means reroute, not steer.** Being stuck is detected after 3 seconds without
-  progress. The answer is a different recorded route, not walking around the obstacle.
+- **Avoidance is reactive, not planned.** It finds obstacles by bumping into them, and it
+  explores only within 8 yalms of the route. A big obstacle, a dead-end alcove, or a gap
+  narrower than the probe angles can find ends in a reroute or a stop, not a detour.
+  Movement in the real game may slide along walls, which helps, but this hasn't been
+  measured in game.
 - **Doors.** Locked doors and doors that need a key item can't be opened. They become
   blocked stretches. Doors that open a menu wait for you.
 
@@ -268,6 +306,9 @@ confirmed on a live client:
 - Escape arrives in the `keyboard` event as DirectInput code 1.
 - Doors have `spawn_type` 34 and status 8 while open (from OpenSesame and Windower's status
   table). Whether the status stays 8 for as long as the door is open hasn't been checked.
+- Obstacle-avoidance timings assume running speed of about 5 yalms per second. A 0.6-yalm
+  threshold in 0.6 s is 20% of that. Slower movement (weight, Gravity) might count as
+  blocked; raise `nav.blocked_seconds` if it does.
 - `os.clock()` measures wall-clock time under Windower, as the Windows C runtime's
   `clock()` does. Other addons use it as a timer.
 
@@ -276,6 +317,8 @@ A first check:
 2. Try `//wp route`, then `//wp go`, with a hand near Escape.
 3. Then try a route through a city door: record it with the door open, and walk it with
    the door closed.
+4. For avoidance, record a route next to an obstacle, then walk a route that cuts across
+   its corner, and watch the overlay show "(avoiding obstacle)".
 
 Please [open an issue](https://github.com/TargetedEntropy/windower-waypoints/issues) with
 what you find.
@@ -290,10 +333,13 @@ lua5.1 tests/run.lua
 
 `tests/run.lua` does two things:
 
-- It tests the four modules directly, using simulated movement.
+- It tests the four modules directly, using simulated movement. This includes avoidance
+  around a pillar, around an L-shaped wall that is open on only one side, and against an
+  endless wall.
 - It loads `waypoints.lua` against a fake Windower, a small simulated world with walls and
   doors. It then plays through these sessions:
   - record, walk, reload, and stop when engaged
+  - steer around a pillar placed on a recorded route
   - walk through a door that opens when poked
   - try a locked door twice, then reroute over a detour
   - stop at a dead end
@@ -315,15 +361,16 @@ avoided:
 |---|---|---|
 | [Path](https://github.com/furiex-ffxi/windower-addons/blob/main/path/path.lua) (Cyrite) | Records a point every second; replays the list forward then backward from the nearest point | Taken: start from the nearest point. Avoided: sampling by time, which bunches points when you stand still, and a single linear path |
 | [Trust](https://github.com/cyritegamestudios/trust) (`cylibs/actions/runtolocation.lua`, `walk.lua`) | Steers with `run(dx, dy)` every frame; releases target lock and `/follow` first | Taken: steering and pre-checks. This addon refuses to start with target lock on rather than toggling it |
-| [Gambit](https://github.com/Kaiconure/Gambit) (`lib/smart-move.lua`) | Stuck detection from average speed; random "jitter" escape; detects a passed point with a halfspace test | Taken: stuck detection and the passed-point test. Avoided: random jitter. A supervised walker should stop and say why |
+| [Gambit](https://github.com/Kaiconure/Gambit) (`lib/smart-move.lua`) | Stuck detection from average speed; escapes obstacles with a random "jitter" heading 135–225° from the target; detects a passed point with a halfspace test | Taken: speed-based detection and the passed-point test. Changed: avoidance probes in a fixed order (45/90/135°, alternating sides, from a frozen heading) and follows the edge, instead of a random escape |
 | [expert-umbrella](https://github.com/sethmccauley/expert-umbrella) (`navigation.lua`) | A node every 4 yalms; nearest-node start filtered by height | Taken: distance-based sampling, height filter |
 | [FastFollow](https://github.com/DiscipleOfEris/FastFollow) | Multibox follow with normalised `run(x, y)` | Taken: normalised run vector |
 | [OpenSesame](https://github.com/Lygre/addons/blob/live/OpenSesame/OpenSesame.lua) (Arcon) | Opens doors with an outgoing `0x01A`; doors are `spawn_type` 34; skips `_` names and `Furniture`; 7 s cooldown | Taken: door test, packet, cooldown, name filter. Added: only closed doors on the route; recorded doors override the filter |
 | [DoorHelper](https://github.com/aragan/my-addons/blob/main/DoorHelper/DoorHelper.lua) | Finds doors by name; answers door menus "Yes" automatically | Avoided: answering menus |
 | [FFXI-NavMesh-Builder](https://github.com/LandSandBoat/FFXI-NavMesh-Builder), [ffxi_navmeshes](https://github.com/Omnione/ffxi_navmeshes) | Navigation meshes built from the game's collision data, for private servers | Not used. Querying them needs Detour (C++), which plain Windower Lua can't load |
 
-None of these builds a graph. The ones that record replay a single line. Joining routes,
-searching them with A*, and rerouting around blocks is what this addon adds.
+None of these builds a graph. The ones that record replay a single line. What this addon
+adds is joining routes, searching them with A*, following obstacle edges, and rerouting
+around blocks.
 
 ## License
 

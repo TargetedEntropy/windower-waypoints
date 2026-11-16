@@ -4,8 +4,8 @@
 
     Record by walking: //wp rec, walk, //wp stop. Routes recorded at different times join
     where they cross. Mark places with //wp mark <name>; walk there with //wp go <name>.
-    Closed doors on the way are opened; a blocked path is routed around when another
-    recorded route exists.
+    Obstacles are steered around; closed doors on the way are opened; a blocked path is
+    routed around when another recorded route exists.
 
     Movement is supervised: //wp stop or Escape stops it, and it stops on its own when stuck
     with no way around, off the route, engaged, dead or zoning. Automated movement can
@@ -18,7 +18,7 @@
 
 _addon.name = 'waypoints'
 _addon.author = 'TargetedEntropy'
-_addon.version = '0.2.0'
+_addon.version = '0.3.0'
 _addon.commands = {'waypoints', 'wp'}
 
 package.path = windower.addon_path .. '?.lua;' .. package.path
@@ -34,7 +34,9 @@ local packets = require('packets')
 local defaults = {
     record = {spacing = 3.0, corner_min = 1.5, corner_angle = 35, merge_radius = 2.0, max_dz = 3.0, jump = 20.0},
     nav = {tolerance = 1.5, final_tolerance = 1.0, stuck_seconds = 3.0, stuck_distance = 1.0, off_route = 12.0,
-           snap_radius = 8.0, block_minutes = 10, max_reroutes = 3},
+           snap_radius = 8.0, block_minutes = 10, max_reroutes = 3,
+           avoid = true, blocked_seconds = 0.6, blocked_distance = 0.6, commit_seconds = 0.6,
+           avoid_max = 12.0, avoid_radius = 8.0},
     doors = {enabled = true, reach = 6.0, width = 3.0, cooldown = 7, wait = 4.0, attempts = 2},
     show = true,
     display = {pos = {x = 20, y = 300}, text = {size = 10, font = 'Consolas'}, bg = {alpha = 160}},
@@ -248,8 +250,9 @@ local function resolve_goal(name)
 end
 
 -- Plans from the player's position to a mark, avoiding blocked edges. `avoid` is an optional
--- set of node ids not to start from (a start node that couldn't be reached).
-local function plan(name, avoid)
+-- set of node ids not to start from (a start node that couldn't be reached); `from` forces
+-- the start node (a rerouted walk starts from the node it last passed).
+local function plan(name, avoid, from)
     local goal = resolve_goal(name)
     if not goal then
         return nil
@@ -260,7 +263,12 @@ local function plan(name, avoid)
         return nil
     end
     local g = state.graph
-    local start, d = g:nearest(pos, settings.nav.snap_radius, settings.record.max_dz + 2, avoid)
+    local start, d
+    if from and g.nodes[from] then
+        start, d = from, graph.dist2d(pos, g.nodes[from])
+    else
+        start, d = g:nearest(pos, settings.nav.snap_radius, settings.record.max_dz + 2, avoid)
+    end
     if not start then
         say('no recorded node within %.0f yalms; walk closer to a recorded route', settings.nav.snap_radius)
         return nil
@@ -313,21 +321,31 @@ local function go(name)
     say('walking to "%s": %.0f yalms, %d points (//wp stop or Escape to stop)', name, length, count)
 end
 
--- Called when the walker reports being stuck. Tries, in order: open a door in the way,
--- route around the blocked edge, give up.
+-- When movement is blocked, a closed door close by is the likeliest cause: stop, open it and
+-- wait for it (each door is tried `doors.attempts` times per walk). Returns true if it did.
+local function try_door(pos)
+    local d = settings.doors
+    local door = door_ahead(pos, {reach = d.reach + 2, width = d.width + 1, max_dz = settings.record.max_dz + 1})
+    if not door or (state.door_tries[door.id] or 0) >= d.attempts then
+        return false
+    end
+    state.door_tries[door.id] = (state.door_tries[door.id] or 0) + 1
+    windower.ffxi.run(false)
+    poke_door(door)
+    state.door_wait = {id = door.id, index = door.index, until_t = os.clock() + d.wait}
+    state.nav:clear_avoid()
+    say('opening %s', door.name ~= '' and door.name or 'a door')
+    return true
+end
+
+-- Called when the walker reports being stuck (avoidance found no way past). Tries, in
+-- order: open a door in the way, route around the blocked edge, give up.
 local function handle_stuck(pos)
     local nav = state.nav
     local where = string.format(' near point %d/%d', nav.index, #nav.points)
 
-    -- 1. A closed door close by (wider search than the walking check).
-    local d = settings.doors
-    local door = door_ahead(pos, {reach = d.reach + 2, width = d.width + 1, max_dz = settings.record.max_dz + 1})
-    if door and (state.door_tries[door.id] or 0) < d.attempts then
-        state.door_tries[door.id] = (state.door_tries[door.id] or 0) + 1
-        windower.ffxi.run(false)
-        poke_door(door)
-        state.door_wait = {id = door.id, index = door.index, until_t = os.clock() + d.wait}
-        say('opening %s', door.name ~= '' and door.name or 'a door')
+    -- 1. A closed door close by.
+    if try_door(pos) then
         return
     end
 
@@ -344,7 +362,9 @@ local function handle_stuck(pos)
         return
     end
     local goal = state.nav_goal
-    local path, length, here = plan(goal, avoid)
+    -- Restart from the node last passed: it's behind us, so known to be reachable, whereas
+    -- the nearest node may be on the far side of whatever blocked us.
+    local path, length, here = plan(goal, avoid, a)
     if not path then
         stop_nav('blocked' .. where)
         return
@@ -369,7 +389,8 @@ local function update_overlay()
         local target = n.points[n.index]
         local pos = me()
         local d = (pos and target) and graph.dist2d(pos, target) or 0
-        local note = state.nav_paused and '  (paused)' or state.door_wait and '  (opening door)' or ''
+        local note = state.nav_paused and '  (paused)' or state.door_wait and '  (opening door)'
+            or n:is_avoiding() and '  (avoiding obstacle)' or ''
         lines = string.format('waypoints  GO  "%s"%s\npoint %d/%d  next %.1f%s',
             state.nav_goal, note, n.index, #n.points, d,
             state.nav_reroutes > 0 and string.format('  rerouted %d', state.nav_reroutes) or '')
@@ -426,7 +447,7 @@ local function tick()
                 return
             end
             state.door_wait = nil
-            state.nav:reset_window()
+            state.nav:clear_avoid()
         end
 
         -- Open a closed door on the path ahead before reaching it.
@@ -444,6 +465,8 @@ local function tick()
             handle_stuck(pos)
         elseif step.stop then
             stop_nav(step.reason .. string.format(' near point %d/%d', state.nav.index, #state.nav.points))
+        elseif step.event == 'blocked' and try_door(pos) then
+            return      -- a door was in the way; wait for it instead of steering around it
         elseif step.dx ~= 0 or step.dy ~= 0 then
             windower.ffxi.run(step.dx, step.dy)
         end

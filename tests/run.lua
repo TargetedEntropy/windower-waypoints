@@ -171,6 +171,66 @@ do
     check('navigator advances past an overshot point', nav.index == 2, nav.index)
 end
 
+-- obstacle avoidance -------------------------------------------------------------------------
+
+local function in_box(x, y, b) return x > b[1] and x < b[3] and y > b[2] and y < b[4] end
+
+do
+    -- A 4x4 pillar on a straight route.
+    local pillar = {8, -2, 12, 2}
+    local blocked = function(x, y) return in_box(x, y, pillar) end
+    local nav = navigator.new({P(20, 0)}, P(0, 0))
+    local events, max_off = 0, 0
+    local pos, t = P(0, 0), 0
+    local step
+    for _ = 1, 400 do
+        t = t + 0.1
+        step = nav:update(pos, t)
+        if step.done or step.stop then break end
+        if step.event == 'blocked' then events = events + 1 end
+        local nx, ny = pos.x + step.dx * 0.5, pos.y + step.dy * 0.5
+        if not blocked(nx, ny) then pos = P(nx, ny) end
+        max_off = math.max(max_off, math.abs(pos.y))
+    end
+    check('avoid: gets around a pillar', step and step.done, step and (step.reason or 'running'))
+    check('avoid: reported the obstacle once', events == 1, events)
+    check('avoid: stays close to the route', max_off <= 8, max_off)
+    check('avoid: never entered the pillar', not in_box(pos.x, pos.y, pillar))
+
+    -- An L-shaped wall: blocked straight ahead and on one side; must find the other side.
+    local wall = {8, 1, 9, 12}             -- vertical wall reaching north; open below y = 1
+    local wall2 = {7, 11, 14, 12}          -- and a cap along the top
+    blocked = function(x, y) return in_box(x, y, wall) or in_box(x, y, wall2) end
+    nav = navigator.new({P(20, 5)}, P(0, 5))
+    pos, t = P(0, 5), 0
+    for _ = 1, 600 do
+        t = t + 0.1
+        step = nav:update(pos, t)
+        if step.done or step.stop then break end
+        local nx, ny = pos.x + step.dx * 0.5, pos.y + step.dy * 0.5
+        if not blocked(nx, ny) then pos = P(nx, ny) end
+    end
+    check('avoid: finds the open side of a corner', step and step.done, step and (step.reason or 'running'))
+
+    -- A wall with no way past within avoid_radius: gives up as stuck.
+    nav = navigator.new({P(20, 0)}, P(0, 0))
+    step = simulate(nav, P(0, 0), 5, 600, 0.1, function(x) return x > 10 end)
+    check('avoid: endless wall ends as stuck', step and step.stop and step.reason == 'stuck',
+        step and (step.reason or 'done'))
+
+    -- Avoidance off: the plain 3-second stuck check.
+    nav = navigator.new({P(20, 0)}, P(0, 0), {avoid = false})
+    local s2, _, t2 = simulate(nav, P(0, 0), 5, 600, 0.1, function(x, y) return in_box(x, y, pillar) end)
+    check('avoid off: pillar means stuck', s2 and s2.reason == 'stuck', s2 and (s2.reason or 'done'))
+    check('avoid off: within two 3-second windows', t2 and t2 <= 6.5, t2)
+
+    -- clear_avoid resets the state machine.
+    nav = navigator.new({P(20, 0)}, P(0, 0))
+    nav.avoiding = {list = {45}, i = 1, mode = 'probe'}
+    nav:clear_avoid()
+    check('avoid: clear_avoid stops avoiding', not nav:is_avoiding())
+end
+
 -- doors ---------------------------------------------------------------------------------------
 
 do
@@ -370,7 +430,7 @@ end
 do
     local door = {id = 0x0100F00B, index = 11, name = 'Door', spawn_type = 34, status = 9, x = 10, y = 0, z = 0}
     local world = {mobs = {door}, door_delay = 1e9}
-    world.blocked = function(x0, y0, x1, y1) return math.abs(y0) < 3 and x0 < 10 and x1 >= 9.5 end
+    world.blocked = function(x0, y0, x1, y1) return math.abs(y1) < 15 and x0 < 10 and x1 >= 9.5 end
     local s = session(world)
     s.cmd('rec')
     s.cmd('mark', 'start')
@@ -392,6 +452,24 @@ do
     s.cmd('unblock')
     s.cmd('blocked')
     check('blocked: unblock clears it', s.said('no blocked paths'))
+    s.close()
+end
+
+-- A pillar on the recorded route (placed after recording): steered around, no reroute.
+do
+    local world = {mobs = {}}
+    local s = session(world)
+    s.cmd('rec')
+    s.cmd('mark', 'start')
+    s.walk_to(30, 0)
+    s.cmd('mark', 'end')
+    s.cmd('stop')
+    world.blocked = function(_, _, x1, y1) return x1 > 13 and x1 < 17 and y1 > -2 and y1 < 2 end
+    s.player.x, s.player.y = 0, 0
+    s.cmd('go', 'end')
+    check('obstacle: arrives around the pillar', s.drive('arrived'), s.chat[#s.chat])
+    check('obstacle: no reroute needed', not s.said('rerouting'))
+    check('obstacle: no stop', not s.said('^waypoints: stopped:'))
     s.close()
 end
 
