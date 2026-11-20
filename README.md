@@ -14,7 +14,7 @@ blocked.
 Windower gives addons no map or collision data, so nothing is guessed: every route the addon
 uses is one you walked.
 
-> **Status: 0.3.0, untested in game.** The logic is covered by 74 offline tests (CI runs
+> **Status: 0.4.0, untested in game.** The logic is covered by 119 offline tests (CI runs
 > them on every push), but it has not yet been run on a live client. See
 > [Verifying in game](#verifying-in-game) before relying on it.
 
@@ -25,6 +25,7 @@ uses is one you walked.
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [How it works](#how-it-works)
+- [Pulling](#pulling)
 - [Settings](#settings)
 - [Data files](#data-files)
 - [Limits](#limits)
@@ -50,6 +51,9 @@ uses is one you walked.
   1. tries to open a nearby door,
   2. then marks that stretch blocked and reroutes over another recorded route,
   3. then stops and tells you where.
+- **Pulling.** `//wp pull on` pulls monsters to a camp mark along the recorded routes. It
+  picks the mob nearest by the routes, not in a straight line, so it doesn't run at walls.
+  See [Pulling](#pulling).
 - **Supervised by design.**
   - Escape or `//wp stop` stops it at any time.
   - It stops by itself when engaged, dead, zoning or off the route.
@@ -108,6 +112,11 @@ Record more routes any time with `//wp rec`. They join the graph wherever they m
 | `//wp marks` | List names in this zone, with distances. |
 | `//wp route <name>` | Show the shortest recorded path's length, without moving. |
 | `//wp go <name>` | Walk there. **Escape** or `//wp stop` stops. |
+| `//wp pull camp <mark>` | Pull to this mark. |
+| `//wp pull add <mob>` / `remove <mob>` / `clear` | Monsters to pull (by name; none listed means any monster). |
+| `//wp pull action ra\|provoke\|dia\|melee` | How to pull. `custom <command> <range>` for anything else. |
+| `//wp pull radius <yalms>` | How far from camp to pull, measured along the routes (default 40). |
+| `//wp pull on` / `off` | Start or stop pulling. `//wp pull` shows the state. |
 | `//wp doors [on\|off]` | Turn door opening on or off (on by default); shows recorded doors. |
 | `//wp blocked` | List stretches found blocked while walking (kept 10 minutes). |
 | `//wp unblock` | Forget them. |
@@ -121,7 +130,7 @@ Names are case-insensitive and may contain spaces (`//wp go home point`).
 
 ## How it works
 
-The logic lives in four modules with no Windower dependencies, so it can be tested outside
+The logic lives in six modules with no Windower dependencies, so it can be tested outside
 the game. `waypoints.lua` connects them to Windower.
 
 | File | Role |
@@ -130,6 +139,8 @@ the game. `waypoints.lua` connects them to Windower.
 | `recorder.lua` | Turns a stream of positions into nodes and edges |
 | `navigator.lua` | Follows a list of points, steering around obstacles; reports arrival, being stuck or leaving the route |
 | `doors.lua` | Which entities are doors, whether they're open, and which one is in the way |
+| `targets.lua` | Which mob to pull: nearest to camp along the routes |
+| `puller.lua` | The pull loop: walk out, pull, run back, fight at camp, repeat; stops |
 | `waypoints.lua` | Commands, events, steering, door packets, rerouting, storage, overlay |
 
 ### Recording
@@ -209,6 +220,47 @@ When obstacle avoidance gives up (or, with avoidance off, after 3 seconds withou
 `//wp blocked` lists the blocked stretches. They are kept in memory only and are cleared
 when you change zones or run `//wp unblock`.
 
+## Pulling
+
+Record the area you hunt in: walk the paths between camp and where the monsters roam, and
+mark the camp. Then:
+
+```
+//wp pull camp camp
+//wp pull add ghost crab        (repeat for each kind; none means any monster)
+//wp pull action ra             (or provoke, dia, melee, or custom "/ma \"Stone\"" 20)
+//wp pull on
+```
+
+Each pull:
+
+1. **Pick.** The candidates are monsters that are alive, unclaimed (or claimed by your
+   party), on the list, and within `pull.snap` (10) yalms of a recorded node on their
+   floor. The one with the shortest route from camp wins: route length plus the last step
+   off the route. A mob behind a wall is close in a straight line but far by the routes,
+   so it isn't chosen first. Mobs more than `pull.radius` (40) yalms away by the routes
+   are ignored.
+2. **Walk out** along the routes to the node nearest the mob, with all the usual avoidance,
+   doors and rerouting. If the mob wanders more than 6 yalms, the walk is re-planned. Past
+   the end of the routes it closes in in a straight line for up to 8 seconds.
+3. **Pull** once in range of the action: it faces the mob and sends the command with the
+   mob's id as the target (`/ra 17203241`). If the mob isn't claimed within
+   `pull.claim_wait` (4) seconds, it tries once more, then leaves that mob alone for 60
+   seconds.
+4. **Run back** to camp along the routes; the mob follows. A melee pull disengages first.
+5. **Fight at camp.** Once the mob is within `pull.engage_range` (6) yalms it sends
+   `/attack`. The fighting is up to you, GearSwap, or a fight addon (Trust in assist mode,
+   for example). If the mob doesn't come within 10 seconds, it goes to meet it.
+6. When every aggroed mob is dead, it pauses 3 to 6 seconds (loot) and picks again.
+
+Anything that attacks the party is fought first, and nothing new is pulled while it is.
+Aggro is tracked from action packets: a monster acting on the party, or the party acting on
+a monster.
+
+Pulling **stops** on Escape, `//wp stop`, `//wp pull off`, death, zoning, HP below
+`pull.min_hp` (40%), more than `pull.max_aggro` (2) mobs at once, a 3-minute fight,
+`pull.max_pulls` (50) pulls or `pull.max_minutes` (60), or when it can't get back to camp.
+
 ## Settings
 
 Windower's config library writes `data/settings.xml` the first time the addon loads. Edit
@@ -242,6 +294,19 @@ it while the addon is unloaded, or run `//lua reload waypoints` afterwards.
 | `doors.cooldown` | 7 | Seconds between opening the same door |
 | `doors.wait` | 4.0 | Seconds to wait for a door after getting stuck |
 | `doors.attempts` | 2 | Tries per door before treating the path as blocked |
+| `pull.camp` | | The camp mark |
+| `pull.names` | | Monsters to pull, comma-separated (empty: any monster) |
+| `pull.action` | ra | `ra`, `provoke`, `dia`, `melee` or `custom` |
+| `pull.command`, `pull.range` | /ra, 17 | The command and its range, for `custom` |
+| `pull.radius` | 40.0 | How far from camp to pull, along the routes |
+| `pull.snap` | 10.0 | How far a mob may be from a recorded node |
+| `pull.max_dz` | 4.0 | Height difference between a mob and its node |
+| `pull.claim_wait` | 4.0 | Seconds for a pull to claim |
+| `pull.engage_range` | 6.0 | Engage at camp once the mob is this close |
+| `pull.max_aggro` | 2 | More mobs than this at once stops pulling |
+| `pull.min_hp` | 40 | Stop below this HP% |
+| `pull.max_pulls` | 50 | Stop after this many pulls |
+| `pull.max_minutes` | 60 | Stop after this long |
 | `show` | true | Status overlay |
 
 ## Data files
@@ -281,6 +346,10 @@ return {
   narrower than the probe angles can find ends in a reroute or a stop, not a detour.
   Movement in the real game may slide along walls, which helps, but this hasn't been
   measured in game.
+- **Pulling knows nothing about the fight.** It engages and waits. It doesn't use
+  weaponskills, heal, or check whether a mob is too strong ("Incredibly Tough"), and it
+  has no line-of-sight check: a pull that can't see the mob simply doesn't claim, and the
+  mob is skipped.
 - **Doors.** Locked doors and doors that need a key item can't be opened. They become
   blocked stretches. Doors that open a menu wait for you.
 
@@ -292,8 +361,11 @@ return {
   use.
 - **Doors** are opened with an injected interaction packet. It's the packet a click sends,
   but it's still automated. `//wp doors off` disables it.
-- **What it doesn't do:** it doesn't answer menus, attack, warp, change your position
-  directly, or move you without a `//wp go`.
+- **Pulling** is automated play: it chooses, pulls and engages monsters on its own. That
+  is the riskiest part of this addon with respect to the terms of service. Watch it, and
+  keep sessions short (`pull.max_minutes`).
+- **What it doesn't do:** it doesn't answer menus, warp, change your position directly, or
+  move or attack without a `//wp go` or `//wp pull on`.
 
 ## Verifying in game
 
@@ -309,6 +381,14 @@ confirmed on a live client:
 - Obstacle-avoidance timings assume running speed of about 5 yalms per second. A 0.6-yalm
   threshold in 0.6 s is 20% of that. Slower movement (weight, Gravity) might count as
   blocked; raise `nav.blocked_seconds` if it does.
+- **Pulling:**
+  - Commands accept a mob's server id as the target (`/ra 17203241`, `/attack 17203241`),
+    as other addons send them.
+  - `windower.ffxi.turn(-atan2(dy, dx))` faces the mob (the heading convention Trust uses
+    for `run`).
+  - `get_player().vitals.hpp` is the player's HP%, and `claim_id` on a mob is the
+    claimer's id.
+  - The `action` event's `actor_id` and `targets[i].id` identify who acted on whom.
 - `os.clock()` measures wall-clock time under Windower, as the Windows C runtime's
   `clock()` does. Other addons use it as a timer.
 
@@ -333,7 +413,7 @@ lua5.1 tests/run.lua
 
 `tests/run.lua` does two things:
 
-- It tests the four modules directly, using simulated movement. This includes avoidance
+- It tests the modules directly, using simulated movement. This includes avoidance
   around a pillar, around an L-shaped wall that is open on only one side, and against an
   endless wall.
 - It loads `waypoints.lua` against a fake Windower, a small simulated world with walls and
@@ -344,6 +424,10 @@ lua5.1 tests/run.lua
   - try a locked door twice, then reroute over a detour
   - stop at a dead end
   - remember a door opened by hand
+  - pull a mob along an L-shaped route, run back, fight it at camp
+- The puller is also tested on its own in a small simulated world: picking by route
+  distance, a pull that never claims, a wandering mob, a mob taken by someone else, an
+  add on the way out, and each stop.
 
 CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the same command on
 every push and pull request.

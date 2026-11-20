@@ -261,6 +261,238 @@ do
     check('doors survive a roundtrip', g2.doors[1234] == 56)
 end
 
+-- pulling: targets and the puller --------------------------------------------------------------
+
+local targets = require('targets')
+local puller = require('puller')
+
+-- A U-shaped route: camp at (0, 0), east to (20, 0), north to (20, 20), west to (0, 20).
+-- A wall runs between the two arms, so (2, 20) is 20 yalms from camp in a straight line but
+-- 60 by the routes.
+local function u_graph()
+    local g = graph.new(100)
+    local prev, ids = nil, {}
+    local pts = {}
+    for x = 0, 20, 4 do pts[#pts + 1] = P(x, 0) end
+    for y = 4, 20, 4 do pts[#pts + 1] = P(20, y) end
+    for x = 16, 0, -4 do pts[#pts + 1] = P(x, 20) end
+    for i, p in ipairs(pts) do
+        ids[i] = g:add_node(p.x, p.y, p.z)
+        if prev then g:link(prev, ids[i]) end
+        prev = ids[i]
+    end
+    g.marks.camp = ids[1]
+    return g, ids
+end
+
+local function M(id, name, x, y, extra)
+    local m = {id = id, index = id - 1000, name = name, x = x, y = y, z = 0, hpp = 100, spawn_type = 16,
+               status = 0, claim_id = 0, valid_target = true}
+    for k, v in pairs(extra or {}) do m[k] = v end
+    return m
+end
+
+do
+    local g, ids = u_graph()
+    local d = g:distances(ids[1], 30)
+    check('distances: along the route', math.abs(d[ids[6]] - 20) < 0.01 and math.abs(d[ids[8]] - 28) < 0.01, d[ids[8]])
+    check('distances: stops at the limit', d[ids[9]] == nil and d[ids[16]] == nil)
+    local blocked = {[graph.edge_key(ids[3], ids[4])] = true}
+    check('distances: blocked edges', g:distances(ids[1], 100, blocked)[ids[5]] == nil)
+
+    local near_by_air = M(1001, 'Crab', 2, 20)       -- other arm: 20 in a line, 60 by the routes
+    local near_by_route = M(1002, 'Crab', 20, -6)    -- 21 in a line, 26 by the routes
+    local mobs = {near_by_air, near_by_route}
+    local pick = targets.pick(g, ids[1], mobs, {max_route = 80, party = {}})
+    check('targets: nearest by the routes, not in a line', pick and pick.mob.id == 1002, pick and pick.mob.id)
+    -- 12 along the route to (12, 0), then 10 straight to the mob (within `snap`).
+    check('targets: route length includes the step off', pick and math.abs(pick.route - 22) < 0.01, pick and pick.route)
+    pick = targets.pick(g, ids[1], {near_by_air}, {max_route = 40, party = {}})
+    check('targets: too far by the routes', pick == nil)
+    pick = targets.pick(g, ids[1], {near_by_air}, {max_route = 80, party = {}})
+    check('targets: within the radius by the routes', pick and pick.mob.id == 1001 and math.abs(pick.route - 58) < 0.01,
+        pick and pick.route)
+
+    local function only(m) return targets.pick(g, ids[1], {m}, {max_route = 80, party = {[7] = true}}, 0) end
+    check('targets: claimed by others', only(M(1003, 'Crab', 20, 2, {claim_id = 99})) == nil)
+    check('targets: claimed by the party', only(M(1004, 'Crab', 20, 2, {claim_id = 7})) ~= nil)
+    check('targets: dead', only(M(1005, 'Crab', 20, 2, {hpp = 0})) == nil)
+    check('targets: not a monster', only(M(1006, 'Crab', 20, 2, {spawn_type = 2})) == nil)
+    check('targets: off the routes', only(M(1007, 'Crab', 10, 10)) == nil)
+    check('targets: another floor', only(M(1008, 'Crab', 20, 2, {z = 12})) == nil)
+    check('targets: names', targets.pick(g, ids[1], {M(1009, 'Bat', 20, 2)}, {max_route = 80, party = {},
+        names = {crab = true}}) == nil)
+    check('targets: skipped', targets.pick(g, ids[1], {M(1010, 'Crab', 20, 2)}, {max_route = 80, party = {},
+        skip = {[1010] = 30}}, 10) == nil)
+end
+
+-- A small world for the puller: the player walks the routes at 5 yalms/s (straight between
+-- nodes is enough here), pulls claim after `claim_delay`, claimed mobs follow at 4 yalms/s,
+-- and an engaged mob dies after `fight` seconds.
+local function pull_world(opts)
+    opts = opts or {}
+    local g, ids = u_graph()
+    local w = {g = g, ids = ids, t = 0, pos = P(0, 0), status = 0, hpp = 100, me = 7, said = {}, pulls = 0,
+               mobs = opts.mobs or {}, path = nil, steer = nil, engaged = nil, walks = 0}
+    local io = {}
+    function io.walk(node)
+        local here = g:nearest(w.pos, 8, 4)
+        local path = here and g:find_path(here, node)
+        if not path then return false, 'no route' end
+        w.path, w.walks = {}, w.walks + 1
+        for i, id in ipairs(path) do w.path[i] = g.nodes[id] end
+        return true
+    end
+    function io.halt() w.path, w.steer = nil, nil end
+    function io.steer(m) w.path, w.steer = nil, m end
+    function io.pull(m)
+        w.pulls = w.pulls + 1
+        if not (opts.unpullable and opts.unpullable[m.id]) then
+            m.claim_at = w.t + (opts.claim_delay or 1)
+        end
+    end
+    function io.engage(m) w.status, w.engaged, w.engaged_at = 1, m, w.t end
+    function io.disengage() w.status = 0 end
+    function io.say(text) w.said[#w.said + 1] = text end
+    w.p = puller.new(io, opts.puller or {}, function() return 0.5 end)
+    w.p:start(ids[1], opts.names, 0)
+
+    local function move(from, to, dist)
+        local dx, dy = to.x - from.x, to.y - from.y
+        local d = math.sqrt(dx * dx + dy * dy)
+        if d <= dist then return P(to.x, to.y), true end
+        return P(from.x + dx / d * dist, from.y + dy / d * dist), false
+    end
+    function w.said_like(pat)
+        for _, s in ipairs(w.said) do if s:find(pat) then return true end end
+        return false
+    end
+    function w.run(seconds)
+        local stop_at = w.t + seconds
+        while w.t < stop_at do
+            local dt = 0.1
+            w.t = w.t + dt
+            if w.path then
+                local reached
+                w.pos, reached = move(w.pos, w.path[1], 5 * dt)
+                if reached then
+                    table.remove(w.path, 1)
+                    if #w.path == 0 then w.path = nil w.p:on_walk('arrived', nil, w.t) end
+                end
+            elseif w.steer then
+                w.pos = move(w.pos, w.steer, 5 * dt)
+                w.steer = nil
+            end
+            for _, m in ipairs(w.mobs) do
+                if m.claim_at and w.t >= m.claim_at then m.claim_id, m.claim_at, m.status = w.me, nil, 1 end
+                if m.claim_id == w.me and m.hpp > 0 then
+                    local np = move(m, w.pos, 4 * dt)
+                    if graph.dist2d(np, w.pos) >= 1.5 then m.x, m.y = np.x, np.y end
+                    w.p:on_action(m.id, {w.me}, true, {[w.me] = true})
+                end
+                if opts.wander and m.wander and w.t >= m.wander.at and not m.wandered then
+                    m.x, m.y, m.wandered = m.wander.x, m.wander.y, true
+                end
+            end
+            if w.engaged and w.t - w.engaged_at >= (opts.fight or 5) then
+                w.engaged.hpp, w.engaged.status, w.engaged = 0, 2, nil
+                w.status = 0
+            end
+            local r = w.p:tick(w.t, {g = g, pos = w.pos, status = w.status, hpp = w.hpp, me = w.me,
+                                     party = {[w.me] = true}, mobs = w.mobs})
+            if r and r.stop then w.stopped = r.stop return r end
+        end
+    end
+    return w
+end
+
+do
+    -- One full pull: walk out by the routes, pull, run back, fight at camp, pull the next.
+    local crab = M(1002, 'Crab', 20, -6)
+    local crab2 = M(1003, 'Crab', 20, 8)
+    local w = pull_world({mobs = {crab, crab2}, puller = {range = 10}})
+    w.run(3)
+    check('puller: walks out by the routes', w.p.state == 'approach' and w.walks == 1 and w.pos.y == 0, w.p.state)
+    for _ = 1, 100 do
+        if w.pulls > 0 then break end
+        w.run(0.1)
+    end
+    check('puller: pulls in range', w.pulls == 1 and graph.dist2d(w.pos, crab) <= 10, graph.dist2d(w.pos, crab))
+    w.run(1.5)
+    check('puller: claimed, then back to camp', crab.claim_id == 7 and w.p.state == 'returning', w.p.state)
+    w.run(25)
+    check('puller: fought at camp', crab.hpp == 0 and graph.dist2d(w.pos, P(0, 0)) <= 3.5, w.p.state)
+    check('puller: says the kill', w.said_like('Crab defeated'))
+    w.run(40)
+    check('puller: pulls the next one', crab2.hpp == 0 and w.p.pulls == 2, w.p.pulls)
+    w.run(10)
+    check('puller: nothing left, waits', w.said_like('nothing to pull') and w.p.state == 'camp' and not w.stopped)
+end
+
+do
+    -- A pull that never claims: tried twice, then skipped and back to camp.
+    local crab = M(1002, 'Crab', 20, -6)
+    local w = pull_world({mobs = {crab}, unpullable = {[1002] = true}, puller = {range = 10}})
+    w.run(40)
+    check('puller: retries the pull once', w.pulls == 2, w.pulls)
+    check('puller: then skips it', w.said_like('skipping Crab') and w.p.skip[1002])
+    check('puller: and goes back to camp', w.p.state == 'camp' and graph.dist2d(w.pos, P(0, 0)) <= 3.5, w.p.state)
+end
+
+do
+    -- The mob wanders while we walk out: the walk is re-planned to its new spot.
+    local crab = M(1002, 'Crab', 20, -6, {wander = {at = 2, x = 18, y = 22}})
+    local w = pull_world({mobs = {crab}, wander = true, puller = {range = 6}})
+    w.run(6)
+    check('puller: re-plans for a wandering mob', w.walks == 2, w.walks)
+    w.run(20)
+    check('puller: still pulls it', w.pulls >= 1 and crab.claim_id == 7)
+end
+
+do
+    -- Taken by someone else on the way: give up and go back.
+    local crab = M(1002, 'Crab', 20, -6)
+    local w = pull_world({mobs = {crab}, puller = {range = 6}})
+    w.run(4)
+    crab.claim_id = 99
+    w.run(0.2)
+    check('puller: gives up a taken mob', w.said_like('gone or taken') and w.p.state == 'returning', w.p.state)
+    w.run(10)
+    check('puller: and goes back to camp', w.p.state == 'camp' and graph.dist2d(w.pos, P(0, 0)) <= 3.5, w.p.state)
+end
+
+do
+    -- Stops: too many mobs, low HP, death.
+    local a, b, c = M(1002, 'Crab', 1, 1), M(1003, 'Crab', 1, 2), M(1004, 'Crab', 2, 1)
+    local w = pull_world({mobs = {a, b, c}})
+    for _, m in ipairs({a, b, c}) do w.p:on_action(m.id, {7}, true, {[7] = true}) end
+    w.run(0.2)
+    check('puller: stops with too many mobs', w.stopped == '3 mobs on you' and not w.p:running(), w.stopped)
+
+    w = pull_world({mobs = {}})
+    w.hpp = 30
+    w.run(0.2)
+    check('puller: stops on low HP', w.stopped and w.stopped:find('HP 30%%'), w.stopped)
+    w = pull_world({mobs = {}})
+    w.status = 2
+    w.run(0.2)
+    check('puller: stops on death', w.stopped == 'you died', w.stopped)
+end
+
+do
+    -- Something aggroes us on the way out: it is fought first, back at camp.
+    local crab = M(1002, 'Crab', 20, -6)
+    local bat = M(1005, 'Bat', 8, 2)
+    local w = pull_world({mobs = {crab, bat}, names = {crab = true}, puller = {range = 6}})
+    w.run(1.5)
+    bat.claim_id = 7
+    w.p:on_action(bat.id, {7}, true, {[7] = true})
+    w.run(15)
+    check('puller: fights the add first', bat.hpp == 0 and crab.hpp == 100 and crab.claim_id == 0)
+    w.run(30)
+    check('puller: then goes back to pulling', crab.hpp == 0)
+end
+
 -- addon sessions ------------------------------------------------------------------------------
 
 -- Loads waypoints.lua into a fake Windower. `world.blocked(x0, y0, x1, y1)` says whether a
@@ -268,7 +500,7 @@ end
 local function session(world)
     local tmp = os.tmpname()
     os.remove(tmp)
-    local env = {dir = tmp .. '_wp/', chat = {}, ran = {}, events = {}, injected = {}, clock = 0,
+    local env = {dir = tmp .. '_wp/', chat = {}, ran = {}, events = {}, injected = {}, clock = 0, sent = {},
                  player = {x = 0, y = 0, z = 0, status = 0}, world = world}
     os.execute('mkdir -p "' .. env.dir .. '"')
 
@@ -309,13 +541,20 @@ local function session(world)
     windower = {
         addon_path = env.dir,
         add_to_chat = function(_, msg) env.chat[#env.chat + 1] = msg end,
+        send_command = function(c) env.sent[#env.sent + 1] = c if world.command then world.command(env, c) end end,
         register_event = function(name, f) env.events[name] = f end,
         file_exists = function(p) local f = io.open(p) if f then f:close() return true end return false end,
         dir_exists = function(p) return os.execute('test -d "' .. p .. '"') == 0 end,
         create_dir = function(p) return os.execute('mkdir "' .. p .. '"') == 0 end,
         ffxi = {
             get_mob_by_target = function() return {x = env.player.x, y = env.player.y, z = env.player.z} end,
-            get_player = function() return {status = env.player.status, target_locked = false} end,
+            get_player = function() return {id = 1, status = env.player.status, target_locked = false,
+                                            vitals = {hpp = env.player.hpp or 100}} end,
+            get_party = function() return {p0 = {mob = {id = 1}}} end,
+            get_mob_by_id = function(id)
+                for _, m in ipairs(world.mobs or {}) do if m.id == id then return m end end
+            end,
+            turn = function(h) env.facing = h end,
             get_info = function() return {zone = 230, logged_in = true} end,
             get_mob_array = function() return world.mobs or {} end,
             get_mob_by_index = mob_by_index,
@@ -332,6 +571,7 @@ local function session(world)
         for _, m in ipairs(world.mobs or {}) do
             if m.opens_at and env.clock >= m.opens_at then m.status, m.opens_at = 8, nil end
         end
+        if world.tick then world.tick(env) end
         env.events['prerender']()
     end
     function env.cmd(...) env.events['addon command'](...) end
@@ -502,6 +742,63 @@ do
     s.cmd('reload')
     s.cmd('doors')
     check('record: door saved', s.said('1 recorded doors'), s.chat[#s.chat])
+    s.close()
+end
+
+-- Pulling in a whole session: camp at (0, 0), a crab off the far end of an L-shaped route.
+-- /ra claims it and it follows; /attack kills it 3 s later.
+do
+    local crab = {id = 1002, index = 2, name = 'Ghost Crab', x = 24, y = 18, z = 0, hpp = 100, spawn_type = 16,
+                  status = 0, claim_id = 0, valid_target = true}
+    local world = {mobs = {crab}}
+    function world.command(env, c)
+        if c == 'input /ra 1002' then crab.claim_id, crab.status = 1, 1 end
+        if c == 'input /attack 1002' then env.player.status, env.attack_at = 1, env.clock end
+    end
+    function world.tick(env)
+        local p = env.player
+        if crab.claim_id == 1 and crab.hpp > 0 then
+            local dx, dy = p.x - crab.x, p.y - crab.y
+            local d = math.sqrt(dx * dx + dy * dy)
+            if d > 1.5 then crab.x, crab.y = crab.x + dx / d * 0.4, crab.y + dy / d * 0.4 end
+            if env.events['action'] then env.events['action']({actor_id = 1002, targets = {{id = 1}}}) end
+        end
+        if env.attack_at and env.clock - env.attack_at >= 3 then
+            crab.hpp, crab.status, p.status, env.attack_at = 0, 2, 0, nil
+        end
+    end
+    local s = session(world)
+    s.cmd('rec')
+    s.cmd('mark', 'camp')
+    s.walk_to(20, 0)
+    s.walk_to(20, 20)
+    s.cmd('stop')
+    s.walk_to(0, 0)
+    s.cmd('pull', 'on')
+    check('pull: needs a camp', s.said('set a camp first'), s.chat[#s.chat])
+    s.cmd('pull', 'camp', 'camp')
+    s.cmd('pull', 'add', 'Ghost', 'Crab')
+    s.cmd('pull', 'action', 'ra')
+    s.cmd('pull', 'on')
+    check('pull: started', s.said('pulling from "camp": ghost crab within 40 yalms'), s.chat[#s.chat])
+    check('pull: picks the crab', s.drive('pulling Ghost Crab', 100), s.chat[#s.chat])
+    local sent_ra = false
+    for _ = 1, 400 do
+        s.drive('$^', 1)
+        for _, c in ipairs(s.sent) do if c == 'input /ra 1002' then sent_ra = true end end
+        if sent_ra then break end
+    end
+    check('pull: walked the routes out and used /ra on it', sent_ra and s.player.x > 15, s.player.x .. ',' .. s.player.y)
+    check('pull: faced it', s.facing ~= nil)
+    check('pull: fights it at camp', s.drive('Ghost Crab defeated', 600), s.chat[#s.chat])
+    check('pull: engaged it near camp', math.abs(s.player.x) <= 4 and math.abs(s.player.y) <= 4,
+        s.player.x .. ',' .. s.player.y)
+    check('pull: /attack sent', s.sent[#s.sent] == 'input /attack 1002', s.sent[#s.sent])
+    check('pull: nothing left', s.drive('nothing to pull', 100))
+    s.cmd('go', 'camp')
+    check('pull: //wp go waits', s.said('stop pulling first'))
+    s.cmd('stop')
+    check('pull: //wp stop stops it', s.said('pulling stopped: by request'), s.chat[#s.chat])
     s.close()
 end
 

@@ -7,6 +7,9 @@
     Obstacles are steered around; closed doors on the way are opened; a blocked path is
     routed around when another recorded route exists.
 
+    Pulling (//wp pull on) pulls monsters to a camp mark along the routes and fights them
+    there (puller.lua, targets.lua).
+
     Movement is supervised: //wp stop or Escape stops it, and it stops on its own when stuck
     with no way around, off the route, engaged, dead or zoning. Automated movement can
     conflict with FFXI's terms of service; keep it to short, attended use.
@@ -18,7 +21,7 @@
 
 _addon.name = 'waypoints'
 _addon.author = 'TargetedEntropy'
-_addon.version = '0.3.0'
+_addon.version = '0.4.0'
 _addon.commands = {'waypoints', 'wp'}
 
 package.path = windower.addon_path .. '?.lua;' .. package.path
@@ -29,6 +32,7 @@ local graph = require('graph')
 local recorder = require('recorder')
 local navigator = require('navigator')
 local doors = require('doors')
+local puller = require('puller')
 local packets = require('packets')
 
 local defaults = {
@@ -38,6 +42,11 @@ local defaults = {
            avoid = true, blocked_seconds = 0.6, blocked_distance = 0.6, commit_seconds = 0.6,
            avoid_max = 12.0, avoid_radius = 8.0},
     doors = {enabled = true, reach = 6.0, width = 3.0, cooldown = 7, wait = 4.0, attempts = 2},
+    -- Pulling (//wp pull): camp is a mark; names is a comma-separated list (empty: any
+    -- monster); action is one of PULL_ACTIONS or 'custom' (command + range).
+    pull = {camp = '', names = '', action = 'ra', command = '/ra', range = 17.0, radius = 40.0,
+            snap = 10.0, max_dz = 4.0, claim_wait = 4.0, engage_range = 6.0, max_aggro = 2, min_hp = 40,
+            max_pulls = 50, max_minutes = 60},
     show = true,
     display = {pos = {x = 20, y = 300}, text = {size = 10, font = 'Consolas'}, bg = {alpha = 160}},
 }
@@ -50,13 +59,24 @@ local TICK = 0.1                                  -- seconds between updates (os
 local NAV_STATUSES = {[0] = true, [5] = true, [85] = true}  -- idle, chocobo, mount
 local DIK_ESCAPE = 1
 
+-- Pull actions: the command (sent with the mob's id as its target) and its range.
+local PULL_ACTIONS = {
+    ra = {command = '/ra', range = 17.0},
+    provoke = {command = '/ja "Provoke"', range = 17.0},
+    dia = {command = '/ma "Dia"', range = 19.0},
+    melee = {command = '/attack', range = 3.0, engages = true},
+}
+
 local state = {
     zone = nil,
     graph = nil,
     dirty = false,
     rec = nil,          -- recorder while recording
     nav = nil,          -- navigator while walking
-    nav_goal = nil,
+    nav_goal = nil,     -- what the walk is to, for messages ("ah", "camp", a mob's name)
+    nav_goal_id = nil,  -- its node
+    pull = nil,         -- puller while pulling
+    pull_walk = false,  -- the current walk is the puller's
     nav_paused = false,
     nav_reroutes = 0,
     door_wait = nil,    -- {id = , index = , until_t = } while waiting for a door to open
@@ -157,11 +177,15 @@ end
 local function stop_nav(reason)
     if state.nav then
         windower.ffxi.run(false)
-        if reason then
+        if state.pull_walk and state.pull then
+            -- The puller decides what a failed walk means; it says so itself.
+            state.pull:on_walk(reason and 'failed' or 'arrived', reason, os.clock())
+        elseif reason then
             say('stopped: %s', reason)
         end
     end
-    state.nav, state.nav_goal, state.nav_paused = nil, nil, false
+    state.pull_walk = false
+    state.nav, state.nav_goal, state.nav_goal_id, state.nav_paused = nil, nil, nil, false
     state.door_wait, state.door_tries, state.nav_reroutes = nil, {}, 0
 end
 
@@ -249,18 +273,19 @@ local function resolve_goal(name)
     return id
 end
 
--- Plans from the player's position to a mark, avoiding blocked edges. `avoid` is an optional
--- set of node ids not to start from (a start node that couldn't be reached); `from` forces
--- the start node (a rerouted walk starts from the node it last passed).
-local function plan(name, avoid, from)
-    local goal = resolve_goal(name)
-    if not goal then
-        return nil
+-- Plans from the player's position to a node, avoiding blocked edges. `label` names it in
+-- messages. `avoid` is an optional set of node ids not to start from (a start node that
+-- couldn't be reached); `from` forces the start node (a rerouted walk starts from the node it
+-- last passed). On failure returns nil and the reason (`quiet` keeps it out of chat).
+local function plan_to(goal, label, avoid, from, quiet)
+    local function fail(fmt, ...)
+        local msg = string.format(fmt, ...)
+        if not quiet then say('%s', msg) end
+        return nil, msg
     end
     local pos = me()
     if not pos then
-        say('no position yet')
-        return nil
+        return fail('no position yet')
     end
     local g = state.graph
     local start, d
@@ -270,20 +295,25 @@ local function plan(name, avoid, from)
         start, d = g:nearest(pos, settings.nav.snap_radius, settings.record.max_dz + 2, avoid)
     end
     if not start then
-        say('no recorded node within %.0f yalms; walk closer to a recorded route', settings.nav.snap_radius)
-        return nil
+        return fail('no recorded node within %.0f yalms; walk closer to a recorded route', settings.nav.snap_radius)
     end
     local blocked = active_blocks()
     local path, length = g:find_path(start, goal, blocked)
     if not path then
         if next(blocked) and g:find_path(start, goal) then
-            say('every recorded route to "%s" is blocked right now (//wp unblock to retry them)', name)
-        else
-            say('"%s" is not connected to the route you are on', name)
+            return fail('every recorded route to "%s" is blocked right now (//wp unblock to retry them)', label)
         end
-        return nil
+        return fail('"%s" is not connected to the route you are on', label)
     end
     return path, length + d, pos
+end
+
+local function plan(name, avoid, from)
+    local goal = resolve_goal(name)
+    if not goal then
+        return nil
+    end
+    return plan_to(goal, name, avoid, from)
 end
 
 local function begin_walk(name, path, pos)
@@ -292,7 +322,7 @@ local function begin_walk(name, path, pos)
         points[i] = state.graph.nodes[id]
     end
     state.nav = navigator.new(points, pos, settings.nav, path)
-    state.nav_goal = name
+    state.nav_goal, state.nav_goal_id = name, path[#path]
     state.door_wait = nil
     return #points
 end
@@ -300,6 +330,10 @@ end
 local function go(name)
     if state.rec then
         say('stop recording first (//wp stop)')
+        return
+    end
+    if state.pull then
+        say('stop pulling first (//wp pull off)')
         return
     end
     local player = windower.ffxi.get_player()
@@ -361,16 +395,18 @@ local function handle_stuck(pos)
         stop_nav('blocked' .. where .. string.format(' after %d reroutes', state.nav_reroutes))
         return
     end
-    local goal = state.nav_goal
+    local goal, goal_id = state.nav_goal, state.nav_goal_id
     -- Restart from the node last passed: it's behind us, so known to be reachable, whereas
     -- the nearest node may be on the far side of whatever blocked us.
-    local path, length, here = plan(goal, avoid, a)
+    local path, length, here = plan_to(goal_id, goal, avoid, a, state.pull_walk)
     if not path then
         stop_nav('blocked' .. where)
         return
     end
     state.nav_reroutes = state.nav_reroutes + 1
+    local pull_walk = state.pull_walk
     begin_walk(goal, path, here)
+    state.pull_walk = pull_walk
     say('path blocked%s; rerouting (%.0f yalms)', where, length)
 end
 
@@ -384,6 +420,11 @@ local function update_overlay()
         local g = state.graph
         lines = string.format('waypoints  REC  %s\nnodes %d  edges %d  new %d',
             zone_name(state.zone), g.count, g:edge_count(), state.rec.added)
+    elseif state.pull then
+        local p = state.pull
+        local t = p.target and p.target.name or ''
+        lines = string.format('waypoints  PULL  %s %s\npulls %d  aggro %d%s', p.state, t, p.pulls,
+            p:aggro_count(), state.nav and string.format('  point %d/%d', state.nav.index, #state.nav.points) or '')
     elseif state.nav then
         local n = state.nav
         local target = n.points[n.index]
@@ -403,6 +444,140 @@ local function update_overlay()
     end
 end
 
+-- Pulling ---------------------------------------------------------------------------------
+
+-- The party's ids (players and their pets), as a set.
+local function party_ids()
+    local ids = {}
+    local ok, party = pcall(windower.ffxi.get_party)
+    if ok and party then
+        for _, k in ipairs({'p0', 'p1', 'p2', 'p3', 'p4', 'p5'}) do
+            local m = party[k] and party[k].mob
+            if m and m.id then
+                ids[m.id] = true
+                if m.pet_index then
+                    local pet = windower.ffxi.get_mob_by_index(m.pet_index)
+                    if pet and pet.id then ids[pet.id] = true end
+                end
+            end
+        end
+    end
+    local me_ = windower.ffxi.get_player()
+    if me_ and me_.id then ids[me_.id] = true end
+    return ids
+end
+
+local function pull_action()
+    local p = settings.pull
+    if p.action == 'custom' then
+        return {command = p.command, range = p.range, engages = p.command:find('^/attack') ~= nil}
+    end
+    return PULL_ACTIONS[p.action] or PULL_ACTIONS.ra
+end
+
+local function pull_names()
+    local names, any = {}, false
+    for n in (settings.pull.names or ''):gmatch('[^,]+') do
+        n = n:gsub('^%s+', ''):gsub('%s+$', ''):lower()
+        if n ~= '' then names[n], any = true, true end
+    end
+    return any and names or nil
+end
+
+local function face(mob)
+    local pos = me()
+    if pos then
+        windower.ffxi.turn(-math.atan2(mob.y - pos.y, mob.x - pos.x))
+    end
+end
+
+local function send_input(text)
+    windower.send_command('input ' .. text)
+end
+
+-- What the puller does in the world.
+local pull_io = {
+    walk = function(node)
+        local label = node == state.pull.camp and 'camp' or (state.pull.target and state.pull.target.name or 'target')
+        local path, length, pos = plan_to(node, label, nil, nil, true)
+        if not path then
+            return false, length
+        end
+        state.pull_walk = false
+        stop_nav()
+        windower.ffxi.follow()
+        begin_walk(label, path, pos)
+        state.pull_walk = true
+        return true
+    end,
+    halt = function()
+        -- Only stop movement the puller started: in a fight something else may be moving you.
+        state.pull_walk = false
+        if state.nav then
+            stop_nav()
+        elseif state.pull_steering then
+            windower.ffxi.run(false)
+        end
+        state.pull_steering = false
+    end,
+    steer = function(mob)
+        local pos = me()
+        if not pos then return end
+        local dx, dy = mob.x - pos.x, mob.y - pos.y
+        local d = math.sqrt(dx * dx + dy * dy)
+        if d > 0.1 then
+            if state.nav then
+                state.pull_walk = false
+                stop_nav()
+            end
+            windower.ffxi.run(dx / d, dy / d)
+            state.pull_steering = true
+        end
+    end,
+    pull = function(mob)
+        face(mob)
+        send_input(string.format('%s %d', pull_action().command, mob.id))
+    end,
+    engage = function(mob)
+        face(mob)
+        send_input(string.format('/attack %d', mob.id))
+    end,
+    disengage = function()
+        send_input('/attackoff')
+    end,
+    say = function(text)
+        say('%s', text)
+    end,
+}
+
+local function stop_pulling(reason)
+    if state.pull then
+        state.pull:stop()
+        state.pull = nil
+        state.pull_walk, state.pull_steering = false, false
+        if reason then
+            say('pulling stopped: %s', reason)
+        end
+    end
+end
+
+local function pull_tick(pos)
+    local player = windower.ffxi.get_player()
+    if not player then
+        return
+    end
+    local mob_me = windower.ffxi.get_mob_by_target('me')
+    local r = state.pull:tick(os.clock(), {
+        g = state.graph, pos = pos, status = player.status,
+        hpp = player.vitals and player.vitals.hpp or (mob_me and mob_me.hpp) or 100,
+        me = player.id, party = party_ids(), mobs = windower.ffxi.get_mob_array() or {},
+        blocked = active_blocks(),
+    })
+    if r and r.stop then
+        stop_pulling(r.stop)
+    end
+end
+
 local function tick()
     local pos = me()
     if not pos then
@@ -414,6 +589,10 @@ local function tick()
         if r then
             state.dirty = true
         end
+    end
+
+    if state.pull then
+        pull_tick(pos)
     end
 
     if state.nav then
@@ -459,7 +638,9 @@ local function tick()
         local step = state.nav:update(pos, os.clock())
         if step.done then
             windower.ffxi.run(false)
-            say('arrived at "%s"', state.nav_goal)
+            if not state.pull_walk then
+                say('arrived at "%s"', state.nav_goal)
+            end
             stop_nav()
         elseif step.stop and step.reason == 'stuck' then
             handle_stuck(pos)
@@ -492,6 +673,8 @@ commands.record = start_recording
 function commands.stop()
     if state.rec then
         stop_recording()
+    elseif state.pull then
+        stop_pulling('by request')
     elseif state.nav then
         stop_nav('by request')
     else
@@ -577,6 +760,101 @@ function commands.go(...)
         return
     end
     go(name)
+end
+
+function commands.pull(sub, ...)
+    sub = (sub or ''):lower()
+    local rest = table.concat({...}, ' ')
+    local p = settings.pull
+    if sub == 'on' then
+        if state.rec then
+            say('stop recording first (//wp stop)')
+            return
+        end
+        local camp = state.graph.marks[(p.camp or ''):lower()]
+        if not camp then
+            say('set a camp first: //wp pull camp <mark>')
+            return
+        end
+        local player = windower.ffxi.get_player()
+        if not player or player.status ~= 0 then
+            say('can only start pulling while idle')
+            return
+        end
+        stop_nav()
+        local a = pull_action()
+        state.pull = puller.new(pull_io, {
+            range = a.range, engages = a.engages, snap = p.snap, max_dz = p.max_dz, max_route = p.radius,
+            claim_wait = p.claim_wait, engage_range = p.engage_range, max_aggro = p.max_aggro,
+            min_hp = p.min_hp, max_pulls = p.max_pulls, max_minutes = p.max_minutes,
+            camp_radius = settings.nav.tolerance * 2,
+        })
+        state.pull:start(camp, pull_names(), os.clock())
+        say('pulling from "%s": %s within %.0f yalms by the routes, with %s (//wp pull off or Escape stops)',
+            p.camp, p.names ~= '' and p.names or 'any monster', p.radius, a.command)
+    elseif sub == 'off' then
+        if state.pull then stop_pulling('by request') else say('not pulling') end
+    elseif sub == 'camp' then
+        local name = rest:lower()
+        if name == '' or not state.graph.marks[name] then
+            say('usage: //wp pull camp <mark> (//wp marks lists them)')
+            return
+        end
+        p.camp = name
+        config.save(settings)
+        say('camp: "%s"', name)
+    elseif sub == 'add' or sub == 'remove' then
+        local name = rest:lower()
+        if name == '' then
+            say('usage: //wp pull %s <mob name>', sub)
+            return
+        end
+        local names, list = pull_names() or {}, {}
+        names[name] = sub == 'add' or nil
+        for n in pairs(names) do list[#list + 1] = n end
+        table.sort(list)
+        p.names = table.concat(list, ',')
+        config.save(settings)
+        say('pull targets: %s', p.names ~= '' and p.names or 'any monster')
+    elseif sub == 'clear' then
+        p.names = ''
+        config.save(settings)
+        say('pull targets: any monster')
+    elseif sub == 'action' then
+        local which = (...)
+        which = which and which:lower()
+        if PULL_ACTIONS[which] then
+            p.action = which
+        elseif which == 'custom' and select(2, ...) then
+            local args = {...}
+            local range = tonumber(args[#args])
+            if not range then
+                say('usage: //wp pull action custom <command> <range>')
+                return
+            end
+            p.action, p.range = 'custom', range
+            p.command = table.concat(args, ' ', 2, #args - 1)
+        else
+            say('usage: //wp pull action ra|provoke|dia|melee, or custom <command> <range>')
+            return
+        end
+        config.save(settings)
+        local a = pull_action()
+        say('pull action: %s (range %.1f)', a.command, a.range)
+    elseif sub == 'radius' then
+        local n = tonumber(rest)
+        if not n or n <= 0 then
+            say('usage: //wp pull radius <yalms>')
+            return
+        end
+        p.radius = n
+        config.save(settings)
+        say('pull radius: %.0f yalms by the routes', n)
+    else
+        local a = pull_action()
+        say('pull: %s; camp "%s"; targets %s; %s (range %.1f); radius %.0f', state.pull and state.pull.state or 'off',
+            p.camp, p.names ~= '' and p.names or 'any monster', a.command, a.range, p.radius)
+    end
 end
 
 function commands.info()
@@ -675,6 +953,9 @@ function commands.help()
         '//wp route <name>              show the shortest recorded path',
         '//wp go <name>                 walk there (//wp stop or Escape stops)',
         '//wp doors [on|off]            open closed doors on the way',
+        '//wp pull camp <mark> | add <mob> | remove <mob> | clear | radius <yalms>',
+        '//wp pull action ra|provoke|dia|melee | custom <command> <range>',
+        '//wp pull on | off             pull to the camp along the routes',
         '//wp blocked | unblock         paths found blocked while walking (kept 10 min)',
         '//wp info | save | reload | clear confirm | show | hide',
     }) do
@@ -714,6 +995,7 @@ windower.register_event('zone change', function(new_id)
     if state.rec then
         stop_recording()
     end
+    stop_pulling(state.pull and 'zoned' or nil)
     stop_nav(state.nav and 'zoned' or nil)
     state.blocked, state.door_last = {}, {}
     save()
@@ -723,6 +1005,22 @@ windower.register_event('zone change', function(new_id)
     else
         state.graph, state.zone = nil, nil
     end
+end)
+
+-- Aggro for the puller: a monster acting on the party, or the party acting on a monster.
+windower.register_event('action', function(act)
+    if not state.pull or not act or not act.actor_id then
+        return
+    end
+    local ids = {}
+    for _, t in ipairs(act.targets or {}) do
+        ids[#ids + 1] = t.id
+    end
+    local function monster(id)
+        local m = windower.ffxi.get_mob_by_id(id)
+        return m ~= nil and m.spawn_type == 16
+    end
+    state.pull:on_action(act.actor_id, ids, monster(act.actor_id), party_ids(), monster)
 end)
 
 -- While recording, a door you open by hand is remembered for this zone, so it is opened
@@ -745,12 +1043,17 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
 end)
 
 windower.register_event('keyboard', function(dik, pressed)
-    if pressed and dik == DIK_ESCAPE and state.nav then
-        stop_nav('Escape')
+    if pressed and dik == DIK_ESCAPE then
+        if state.pull then
+            stop_pulling('Escape')
+        elseif state.nav then
+            stop_nav('Escape')
+        end
     end
 end)
 
 windower.register_event('logout', function()
+    stop_pulling()
     if state.rec then stop_recording() end
     stop_nav()
     save()
@@ -772,6 +1075,7 @@ windower.register_event('load', function()
 end)
 
 windower.register_event('unload', function()
+    stop_pulling()
     if state.nav then
         windower.ffxi.run(false)
     end

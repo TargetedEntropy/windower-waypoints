@@ -198,6 +198,37 @@ function graph:find_path(start, goal, blocked)
     return nil
 end
 
+-- Route distance from `start` to every node within `max_len` (Dijkstra, stopping at
+-- `max_len`). Returns id -> distance. Used to measure "how far by the routes" for many
+-- places at once (the puller's candidate mobs). `blocked` as in find_path.
+function graph:distances(start, max_len, blocked)
+    local nodes, edges = self.nodes, self.edges
+    if not nodes[start] then
+        return {}
+    end
+    max_len = max_len or huge
+    local dist, done = {[start] = 0}, {}
+    local open = {ids = {}, f = {}, n = 0}
+    heap_push(open, start, 0)
+    while open.n > 0 do
+        local current = heap_pop(open)
+        if not done[current] then
+            done[current] = true
+            local cn = nodes[current]
+            for nb in pairs(edges[current]) do
+                if not done[nb] and not (blocked and blocked[graph.edge_key(current, nb)]) then
+                    local d = dist[current] + dist3d(cn, nodes[nb])
+                    if d <= max_len and d < (dist[nb] or huge) then
+                        dist[nb] = d
+                        heap_push(open, nb, d)
+                    end
+                end
+            end
+        end
+    end
+    return dist
+end
+
 -- Serialization -----------------------------------------------------------------------------
 
 local function fmt(v)
