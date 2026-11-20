@@ -45,7 +45,10 @@ end
      camp       the camp node id
      mobs       an array or map of mob tables (Windower's get_mob_array)
      opts = {names = {['name'] = true}, party = {[id] = true}, skip = {[id] = until},
-             snap = 10, max_dz = 4, max_route = 40, blocked = {edge keys}}
+             snap = 10, max_dz = 4, max_route = 40, blocked = {edge keys},
+             crowd_radius = 8, crowd_penalty = 20}
+            A mob with other monsters within crowd_radius costs crowd_penalty yalms more per
+            neighbour: lone mobs first, so pulls don't bring links.
      now        for the skip list
    Returns {mob = , node = , route = yalms by the routes from camp to the mob} or nil. ]]
 function targets.pick(g, camp, mobs, opts, now)
@@ -55,17 +58,33 @@ function targets.pick(g, camp, mobs, opts, now)
     local max_route = opts.max_route or 40
     local dist = g:distances(camp, max_route, opts.blocked)
     local snap, max_dz = opts.snap or 10, opts.max_dz or 4
+    local crowd_r, crowd_pen = opts.crowd_radius or 0, opts.crowd_penalty or 20
+    local monsters = {}
+    if crowd_r > 0 then
+        for _, o in pairs(mobs) do
+            if type(o) == 'table' and o.x and o.spawn_type == targets.MONSTER and targets.alive(o) then
+                monsters[#monsters + 1] = o
+            end
+        end
+    end
     local best
     for _, m in pairs(mobs) do
         if type(m) == 'table' and m.x and wanted(m, opts, now) then
+            local crowd = 0
+            for _, o in ipairs(monsters) do
+                if o ~= m and math.abs((o.z or 0) - (m.z or 0)) <= max_dz and graph.dist2d(o, m) <= crowd_r then
+                    crowd = crowd + 1
+                end
+            end
+            local extra = crowd * crowd_pen
             -- The best way in: the reachable node near the mob with the shortest route plus
             -- step off (not simply the nearest node, which may be the long way round).
             for node, d in pairs(dist) do
                 local n = g.nodes[node]
                 if math.abs(n.z - (m.z or 0)) <= max_dz then
                     local off = graph.dist2d(n, m)
-                    if off <= snap and d + off <= max_route and (not best or d + off < best.route) then
-                        best = {mob = m, node = node, route = d + off}
+                    if off <= snap and d + off <= max_route and (not best or d + off + extra < best.cost) then
+                        best = {mob = m, node = node, route = d + off, cost = d + off + extra, crowd = crowd}
                     end
                 end
             end

@@ -14,7 +14,7 @@ blocked.
 Windower gives addons no map or collision data, so nothing is guessed: every route the addon
 uses is one you walked.
 
-> **Status: 0.4.0, untested in game.** The logic is covered by 119 offline tests (CI runs
+> **Status: 0.5.0, untested in game.** The logic is covered by 180 offline tests (CI runs
 > them on every push), but it has not yet been run on a live client. See
 > [Verifying in game](#verifying-in-game) before relying on it.
 
@@ -26,6 +26,7 @@ uses is one you walked.
 - [Commands](#commands)
 - [How it works](#how-it-works)
 - [Pulling](#pulling)
+- [Fighting](#fighting)
 - [Settings](#settings)
 - [Data files](#data-files)
 - [Limits](#limits)
@@ -54,6 +55,9 @@ uses is one you walked.
 - **Pulling.** `//wp pull on` pulls monsters to a camp mark along the recorded routes. It
   picks the mob nearest by the routes, not in a straight line, so it doesn't run at walls.
   See [Pulling](#pulling).
+- **Fighting.** With a profile per job, it fights too: melee range and facing,
+  weaponskills, opening abilities, buffs, heals, resting, Trust NPCs, food and EXP/CP
+  rings. You don't need a separate fight addon. See [Fighting](#fighting).
 - **Supervised by design.**
   - Escape or `//wp stop` stops it at any time.
   - It stops by itself when engaged, dead, zoning or off the route.
@@ -116,7 +120,17 @@ Record more routes any time with `//wp rec`. They join the graph wherever they m
 | `//wp pull add <mob>` / `remove <mob>` / `clear` | Monsters to pull (by name; none listed means any monster). |
 | `//wp pull action ra\|provoke\|dia\|melee` | How to pull. `custom <command> <range>` for anything else. |
 | `//wp pull radius <yalms>` | How far from camp to pull, measured along the routes (default 40). |
+| `//wp pull camp <a>,<b>,...` | Several camps: move on when one has nothing to pull for 30 s. |
 | `//wp pull on` / `off` | Start or stop pulling. `//wp pull` shows the state. |
+| `//wp pull pause` / `resume` | Finish the current fight, then wait at camp. |
+| `//wp fight` | Show this job's fight profile. |
+| `//wp fight ws <name> [tp]` / `ws off` | Weaponskill, at 1000 TP unless given. |
+| `//wp fight add open\|buff\|heal <use> [HP%]` | Add an opener, a buff to keep up, or a heal (`use`: `ja:Name`, `ma:Name`, `item:Name`). |
+| `//wp fight remove open\|buff\|heal <use>` / `clear open\|buffs\|heals\|trusts` | Take them out again. |
+| `//wp fight trust add\|remove <name>` | Trust NPCs to call at camp. |
+| `//wp fight food <item>` / `ring <item>` | Food, and an EXP/CP ring, kept up between fights (`off` to stop). |
+| `//wp fight rest <HP%> [MP%]` | Rest at camp below these. |
+| `//wp fight on` / `off` | Fight with the profile, or leave fights to you or another addon. |
 | `//wp doors [on\|off]` | Turn door opening on or off (on by default); shows recorded doors. |
 | `//wp blocked` | List stretches found blocked while walking (kept 10 minutes). |
 | `//wp unblock` | Forget them. |
@@ -130,7 +144,7 @@ Names are case-insensitive and may contain spaces (`//wp go home point`).
 
 ## How it works
 
-The logic lives in six modules with no Windower dependencies, so it can be tested outside
+The logic lives in seven modules with no Windower dependencies, so it can be tested outside
 the game. `waypoints.lua` connects them to Windower.
 
 | File | Role |
@@ -140,7 +154,8 @@ the game. `waypoints.lua` connects them to Windower.
 | `navigator.lua` | Follows a list of points, steering around obstacles; reports arrival, being stuck or leaving the route |
 | `doors.lua` | Which entities are doors, whether they're open, and which one is in the way |
 | `targets.lua` | Which mob to pull: nearest to camp along the routes |
-| `puller.lua` | The pull loop: walk out, pull, run back, fight at camp, repeat; stops |
+| `puller.lua` | The pull loop: walk out, pull, run back, fight at camp, repeat; camps, pauses, stops |
+| `fighter.lua` | The fight (heals, range, facing, openers, buffs, weaponskill) and camp (food, ring, Trusts, buffs, rest) |
 | `waypoints.lua` | Commands, events, steering, door packets, rerouting, storage, overlay |
 
 ### Recording
@@ -257,9 +272,72 @@ Anything that attacks the party is fought first, and nothing new is pulled while
 Aggro is tracked from action packets: a monster acting on the party, or the party acting on
 a monster.
 
-Pulling **stops** on Escape, `//wp stop`, `//wp pull off`, death, zoning, HP below
-`pull.min_hp` (40%), more than `pull.max_aggro` (2) mobs at once, a 3-minute fight,
-`pull.max_pulls` (50) pulls or `pull.max_minutes` (60), or when it can't get back to camp.
+**Choosing well.**
+- **Lone mobs first.** A mob with other monsters within `pull.crowd_radius` (8) yalms
+  counts as 20 yalms farther per neighbour, so pulls rarely bring links.
+- **Several camps.** `//wp pull camp a,b,c` moves to the next camp when one has had nothing
+  to pull for `pull.roam_after` (30) seconds.
+- **Failed pulls.** "Unable to see", "too far away", no ammo and the like drop the mob at
+  once. Three failed pulls in a row stop pulling, because that usually means the pull action
+  itself is wrong.
+- **Stolen mobs.** If someone else claims your mob, it lets go, says so, and pulls the next.
+
+**Stopping.**
+- **At once:** Escape, `//wp stop`, `//wp pull off`, a tell, death, zoning, a 3-minute
+  fight, or not being able to get back to camp.
+- **After the current fight,** so you're never left engaged and idle: more than
+  `pull.max_aggro` (2) mobs at once, `pull.max_pulls` (50), or `pull.max_minutes` (60).
+  Without a fight profile, HP below `pull.min_hp` (40%) is also a stop; with one, it rests
+  instead.
+- **Summary.** On stopping it reports kills, pulls, time, and EXP/CP per hour. The overlay
+  shows the same while it runs.
+
+## Fighting
+
+Each job has a profile in `data/fight/<JOB>.lua`, a plain Lua table. Set it with
+`//wp fight` commands, or edit the file:
+
+```lua
+return {
+    weaponskill = {name = "Raging Axe", tp = 1000},
+    open = {"ja:Berserk", "ja:Provoke"},                  -- once per fight
+    buffs = {
+        {use = "ma:Protect"},                              -- kept up at camp (spells, items)
+        {use = "ja:Warcry", when = "fight"},               -- kept up in fights (abilities)
+        {use = "ma:Utsusemi: Ni", buff = "Copy Image"},    -- when the buff's name differs
+    },
+    heals = {{use = "ma:Cure II", hpp = 50}, {use = "item:Hi-Potion", hpp = 35}},
+    rest = {hpp = 60, mpp = 30, until_hpp = 95, until_mpp = 90},
+    trusts = {"Valaineral", "Kupipi", "Excenmille"},
+    food = "Grape Daifuku",
+    ring = {name = "Echad Ring", buff = "Dedication"},
+    reach = 3.0,
+}
+```
+
+**In a fight**, each step it does the first of these that applies:
+1. **Heal** with the first `heals` entry whose HP% you're under and that's ready (it stands
+   still to cast).
+2. **Close in** to melee reach (plus half the mob's size) and **face** the mob.
+3. **Openers**, once each per fight. Enemy abilities and spells (Provoke, Dia) go at the mob;
+   others go on you.
+4. **Fight buffs** that are missing.
+5. **Weaponskill** at the TP set, but not on a mob under 5% HP.
+
+**At camp**, before each pull:
+1. Food, if the Food buff is gone.
+2. The EXP/CP ring, if its buff is gone. It equips the ring, waits 8 seconds for the equip
+   delay, then uses it.
+3. Missing Trust NPCs, while the party has room. A Trust that fails to join twice is left
+   for 5 minutes.
+4. Camp buffs that are missing.
+5. Rest (`/heal`) below `rest.hpp` or `rest.mpp`, until `until_hpp` and `until_mpp`.
+
+"Ready" means known, off recast, enough MP or TP, and not silenced, amnesic, asleep or
+stunned, all read from Windower. Nothing is sent while a spell or item is in progress, and
+commands are spaced about a second apart. A buff that doesn't appear after use is retried
+after 20 seconds. A buff name that the game doesn't have is reported when pulling starts.
+`//wp fight off` leaves fights to you or another addon.
 
 ## Settings
 
@@ -307,6 +385,9 @@ it while the addon is unloaded, or run `//lua reload waypoints` afterwards.
 | `pull.min_hp` | 40 | Stop below this HP% |
 | `pull.max_pulls` | 50 | Stop after this many pulls |
 | `pull.max_minutes` | 60 | Stop after this long |
+| `pull.crowd_radius` | 8.0 | Prefer mobs without other monsters this close (0: off) |
+| `pull.roam_after` | 30 | With several camps, seconds without a target before moving on |
+| `fight.enabled` | true | Fight with the job's profile while pulling |
 | `show` | true | Status overlay |
 
 ## Data files
@@ -346,10 +427,12 @@ return {
   narrower than the probe angles can find ends in a reroute or a stop, not a detour.
   Movement in the real game may slide along walls, which helps, but this hasn't been
   measured in game.
-- **Pulling knows nothing about the fight.** It engages and waits. It doesn't use
-  weaponskills, heal, or check whether a mob is too strong ("Incredibly Tough"), and it
-  has no line-of-sight check: a pull that can't see the mob simply doesn't claim, and the
-  mob is skipped.
+- **The fight is a priority list, not a planner.** There are no skillchains, magic bursts,
+  enmity management or debuff tracking. It doesn't check how strong a mob is ("Incredibly
+  Tough"), so keep the name list to mobs you can solo.
+- **Line of sight** isn't known in advance. A pull that can't see the mob is refused by the
+  game, and the mob is skipped.
+- **Loot** isn't lotted. With Trust NPCs in the party, drops wait in the treasure pool.
 - **Doors.** Locked doors and doors that need a key item can't be opened. They become
   blocked stretches. Doors that open a menu wait for you.
 
@@ -389,6 +472,14 @@ confirmed on a live client:
   - `get_player().vitals.hpp` is the player's HP%, and `claim_id` on a mob is the
     claimer's id.
   - The `action` event's `actor_id` and `targets[i].id` identify who acted on whom.
+- **Fighting:**
+  - `/ja "X" <me>`, `/ma "X" <id>`, `/ws "X" <id>`, `/item "X" <me>`, `/heal on|off`,
+    `/attackoff` and `/equip ring1 "X"` behave as typed.
+  - `vitals.max_mp` (or `player.max_mp`) is the MP pool, and status 33 is resting.
+  - `targets.Enemy` in the ability and spell resources marks enemy-targeted actions.
+  - An EXP ring's equip delay is under 8 seconds. Raise `ring.delay` in the profile if the
+    use is refused.
+  - The pull-refusal texts ("Unable to see", "too far away", ...) are matched in English.
 - `os.clock()` measures wall-clock time under Windower, as the Windows C runtime's
   `clock()` does. Other addons use it as a timer.
 
@@ -425,9 +516,14 @@ lua5.1 tests/run.lua
   - stop at a dead end
   - remember a door opened by hand
   - pull a mob along an L-shaped route, run back, fight it at camp
+  - set a fight profile by command, eat before pulling, finish with a weaponskill, stop on
+    a tell
 - The puller is also tested on its own in a small simulated world: picking by route
-  distance, a pull that never claims, a wandering mob, a mob taken by someone else, an
-  add on the way out, and each stop.
+  distance, crowded mobs, a pull that never claims or is refused, a wandering mob, a mob
+  taken by someone else (before and during the fight), adds, several camps, pausing, and
+  each stop.
+- The fighter is tested step by step: range and facing, weaponskills, openers, buffs,
+  heals, resting, Trusts, food and the ring.
 
 CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the same command on
 every push and pull request.

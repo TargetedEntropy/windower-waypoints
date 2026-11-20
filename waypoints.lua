@@ -8,7 +8,7 @@
     routed around when another recorded route exists.
 
     Pulling (//wp pull on) pulls monsters to a camp mark along the routes and fights them
-    there (puller.lua, targets.lua).
+    there with the job's fight profile (puller.lua, targets.lua, fighter.lua).
 
     Movement is supervised: //wp stop or Escape stops it, and it stops on its own when stuck
     with no way around, off the route, engaged, dead or zoning. Automated movement can
@@ -21,7 +21,7 @@
 
 _addon.name = 'waypoints'
 _addon.author = 'TargetedEntropy'
-_addon.version = '0.4.0'
+_addon.version = '0.5.0'
 _addon.commands = {'waypoints', 'wp'}
 
 package.path = windower.addon_path .. '?.lua;' .. package.path
@@ -33,6 +33,7 @@ local recorder = require('recorder')
 local navigator = require('navigator')
 local doors = require('doors')
 local puller = require('puller')
+local fighter = require('fighter')
 local packets = require('packets')
 
 local defaults = {
@@ -46,7 +47,8 @@ local defaults = {
     -- monster); action is one of PULL_ACTIONS or 'custom' (command + range).
     pull = {camp = '', names = '', action = 'ra', command = '/ra', range = 17.0, radius = 40.0,
             snap = 10.0, max_dz = 4.0, claim_wait = 4.0, engage_range = 6.0, max_aggro = 2, min_hp = 40,
-            max_pulls = 50, max_minutes = 60},
+            max_pulls = 50, max_minutes = 60, crowd_radius = 8.0, roam_after = 30},
+    fight = {enabled = true},      -- run fights with the job's profile (data/fight/<JOB>.lua)
     show = true,
     display = {pos = {x = 20, y = 300}, text = {size = 10, font = 'Consolas'}, bg = {alpha = 160}},
 }
@@ -76,6 +78,8 @@ local state = {
     nav_goal = nil,     -- what the walk is to, for messages ("ah", "camp", a mob's name)
     nav_goal_id = nil,  -- its node
     pull = nil,         -- puller while pulling
+    fighter = nil,      -- its fighter (nil when //wp fight off)
+    stats = nil,        -- {started, exp, cp, lp} for the pulling session
     pull_walk = false,  -- the current walk is the puller's
     nav_paused = false,
     nav_reroutes = 0,
@@ -423,8 +427,12 @@ local function update_overlay()
     elseif state.pull then
         local p = state.pull
         local t = p.target and p.target.name or ''
-        lines = string.format('waypoints  PULL  %s %s\npulls %d  aggro %d%s', p.state, t, p.pulls,
-            p:aggro_count(), state.nav and string.format('  point %d/%d', state.nav.index, #state.nav.points) or '')
+        local st = state.stats
+        local mins = st and (os.clock() - st.started) / 60 or 0
+        local rate = (st and mins > 0.5) and string.format('  %d EXP/h', math.floor(st.exp / mins * 60)) or ''
+        lines = string.format('waypoints  PULL  %s%s %s\nkills %d  pulls %d  aggro %d  %dm%s%s', p.state, p.paused and ' (paused)' or '', t, p.kills,
+            p.pulls, p:aggro_count(), math.floor(mins), rate,
+            state.nav and string.format('  point %d/%d', state.nav.index, #state.nav.points) or '')
     elseif state.nav then
         local n = state.nav
         local target = n.points[n.index]
@@ -444,10 +452,227 @@ local function update_overlay()
     end
 end
 
+-- Fighting: profiles, what's usable, and the commands ------------------------------------
+
+local function job_name()
+    local p = windower.ffxi.get_player()
+    return p and p.main_job or 'NON'
+end
+
+local function profile_path(job)
+    return windower.addon_path .. 'data/fight/' .. job .. '.lua'
+end
+
+-- A plain-Lua writer for profiles (strings, numbers, booleans, lists, records).
+local function lua_value(v, indent)
+    indent = indent or ''
+    local t = type(v)
+    if t == 'string' then return string.format('%q', v) end
+    if t ~= 'table' then return tostring(v) end
+    if next(v) == nil then return '{}' end
+    local inner, out = indent .. '    ', {}
+    if #v > 0 then
+        for _, x in ipairs(v) do out[#out + 1] = inner .. lua_value(x, inner) .. ',' end
+    else
+        local keys = {}
+        for k in pairs(v) do keys[#keys + 1] = k end
+        table.sort(keys)
+        for _, k in ipairs(keys) do out[#out + 1] = inner .. k .. ' = ' .. lua_value(v[k], inner) .. ',' end
+    end
+    return '{\n' .. table.concat(out, '\n') .. '\n' .. indent .. '}'
+end
+
+local function load_profile(job)
+    local path = profile_path(job)
+    if not windower.file_exists(path) then
+        return {}
+    end
+    local chunk, err = loadfile(path)
+    if not chunk then
+        say('could not read %s: %s', path, tostring(err))
+        return {}
+    end
+    setfenv(chunk, {})
+    local ok, t = pcall(chunk)
+    if not ok or type(t) ~= 'table' then
+        say('could not load %s', path)
+        return {}
+    end
+    return t
+end
+
+local function save_profile(job, profile)
+    for _, d in ipairs({'data/', 'data/fight/'}) do
+        local p = windower.addon_path .. d
+        if not windower.dir_exists(p) then windower.create_dir(p) end
+    end
+    local f, err = io.open(profile_path(job), 'w')
+    if not f then
+        say('could not save the %s profile: %s', job, tostring(err))
+        return
+    end
+    f:write('-- waypoints fight profile for ' .. job .. ' (see README: Fighting). Edit freely.\n')
+    f:write('return ' .. lua_value(profile) .. '\n')
+    f:close()
+end
+
+-- Game state that's expensive to read, cached for one tick (the fighter may ask many
+-- times per tick at 10 Hz).
+local cache = {}
+local function cached(key, fn)
+    local v = cache[key]
+    if v == nil then
+        v = fn() or false
+        cache[key] = v
+    end
+    return v or nil
+end
+local function new_tick()
+    cache = {}
+end
+
+-- Resource lookups by English name, built on first use.
+local lookup
+local function names()
+    if lookup then return lookup end
+    local res = require('resources')
+    lookup = {ma = {}, ja = {}, ws = {}, item = {}, buffs = {}}
+    for id, sp in pairs(res.spells or {}) do if sp.en then lookup.ma[sp.en:lower()] = sp end end
+    for id, a in pairs(res.job_abilities or {}) do if a.en then lookup.ja[a.en:lower()] = a end end
+    for id, w in pairs(res.weapon_skills or {}) do if w.en then lookup.ws[w.en:lower()] = w end end
+    for id, it in pairs(res.items or {}) do if it.en then lookup.item[it.en:lower()] = it.id or id end end
+    for id, b in pairs(res.buffs or {}) do if b.en then lookup.buffs[id] = b.en:lower() end end
+    return lookup
+end
+
+local function buff_names(player)
+    local out, map = {}, names().buffs
+    for _, id in ipairs(player.buffs or {}) do
+        if map[id] then out[map[id]] = true end
+    end
+    return out
+end
+
+local function contains(list, id)
+    for _, x in pairs(list or {}) do if x == id then return true end end
+    return false
+end
+
+-- Bags an item may be used or equipped from: inventory, temporary, wardrobes.
+local USE_BAGS = {0, 3, 8, 10, 11, 12, 13, 14, 15, 16}
+
+-- item id -> count over the usable bags, read once per tick.
+local function item_counts()
+    return cached('items', function()
+        local counts = {}
+        for _, bag in ipairs(USE_BAGS) do
+            local ok, items = pcall(windower.ffxi.get_items, bag)
+            if ok and type(items) == 'table' then
+                for _, it in pairs(items) do
+                    if type(it) == 'table' and it.id and it.id ~= 0 then
+                        counts[it.id] = (counts[it.id] or 0) + (it.count or 1)
+                    end
+                end
+            end
+        end
+        return counts
+    end)
+end
+
+local function item_count(name)
+    local id = names().item[(name or ''):lower()]
+    return id and (item_counts()[id] or 0) or 0
+end
+
+local NO_MAGIC = {[6] = true, [29] = true}                       -- silence, mute
+local NO_ABILITY = {[16] = true}                                 -- amnesia
+local NO_ACTION = {[2] = true, [7] = true, [10] = true, [28] = true, [19] = true}  -- sleep, petrify, stun, terror, sleep
+
+-- Can the player use this right now? Returns ok, {cast = seconds}.
+local function can_use(kind, name)
+    local player = cached('player', windower.ffxi.get_player)
+    if not player then return false end
+    local blocked = {}
+    for _, id in ipairs(player.buffs or {}) do blocked[id] = true end
+    for id in pairs(NO_ACTION) do if blocked[id] then return false end end
+    local v = player.vitals or {}
+    local key = (name or ''):lower()
+    local L = names()
+    if kind == 'ma' then
+        local sp = L.ma[key]
+        if not sp then return false end
+        for id in pairs(NO_MAGIC) do if blocked[id] then return false end end
+        local learned = cached('spells', windower.ffxi.get_spells) or {}
+        if not learned[sp.id] then return false end
+        if sp.type ~= 'Trust' then
+            local lv = sp.levels or {}
+            local main_ok = lv[player.main_job_id] and lv[player.main_job_id] <= (player.main_job_level or 0)
+            local sub_ok = lv[player.sub_job_id] and lv[player.sub_job_id] <= (player.sub_job_level or 0)
+            if not (main_ok or sub_ok) then return false end
+        end
+        if ((cached('spell_recasts', windower.ffxi.get_spell_recasts) or {})[sp.id] or 0) > 0 then return false end
+        if (v.mp or 0) < (sp.mp_cost or 0) then return false end
+        local tg = sp.targets or {}
+        return true, {cast = sp.cast_time or 3, enemy = tg.Enemy == true and not tg.Self}
+    elseif kind == 'ja' or kind == 'ws' then
+        for id in pairs(NO_ABILITY) do if blocked[id] then return false end end
+        local a = L[kind][key]
+        if not a then return false end
+        local abilities = cached('abilities', windower.ffxi.get_abilities) or {}
+        if kind == 'ws' then
+            return contains(abilities.weapon_skills, a.id) and (v.tp or 0) >= 1000
+        end
+        if not contains(abilities.job_abilities, a.id) then return false end
+        if ((cached('ability_recasts', windower.ffxi.get_ability_recasts) or {})[a.recast_id] or 0) > 0 then
+            return false
+        end
+        local tg = a.targets or {}
+        return (v.tp or 0) >= (a.tp_cost or 0), {enemy = tg.Enemy == true and not tg.Self}
+    elseif kind == 'item' then
+        return item_count(name) > 0
+    end
+    return false
+end
+
+local function trust_party()
+    local set, size = {}, 0
+    local ok, party = pcall(windower.ffxi.get_party)
+    if ok and party then
+        for _, k in ipairs({'p0', 'p1', 'p2', 'p3', 'p4', 'p5'}) do
+            local m = party[k]
+            if m and m.name then
+                size = size + 1
+                set[fighter.trust_key(m.name)] = true
+            end
+        end
+    end
+    return set, math.max(size, 1)
+end
+
+local TARGET_TOKEN = {me = '<me>'}
+
+local fight_io = {
+    use = function(kind, name, target)
+        local t = type(target) == 'table' and tostring(target.id) or TARGET_TOKEN[target] or '<me>'
+        local verb = ({ja = '/ja', ma = '/ma', ws = '/ws', item = '/item'})[kind]
+        windower.send_command(string.format('input %s "%s" %s', verb, name, t))
+    end,
+    equip = function(slot, name)
+        windower.send_command(string.format('input /equip %s "%s"', slot, name))
+    end,
+    rest = function(on)
+        windower.send_command('input /heal ' .. (on and 'on' or 'off'))
+    end,
+    say = function(text)
+        say('%s', text)
+    end,
+}
+
 -- Pulling ---------------------------------------------------------------------------------
 
 -- The party's ids (players and their pets), as a set.
 local function party_ids()
+    return cached('party_ids', function()
     local ids = {}
     local ok, party = pcall(windower.ffxi.get_party)
     if ok and party then
@@ -465,6 +690,7 @@ local function party_ids()
     local me_ = windower.ffxi.get_player()
     if me_ and me_.id then ids[me_.id] = true end
     return ids
+    end)
 end
 
 local function pull_action()
@@ -498,7 +724,7 @@ end
 -- What the puller does in the world.
 local pull_io = {
     walk = function(node)
-        local label = node == state.pull.camp and 'camp' or (state.pull.target and state.pull.target.name or 'target')
+        local label = node == state.pull.camp and state.pull:camp_name() or (state.pull.target and state.pull.target.name or 'target')
         local path, length, pos = plan_to(node, label, nil, nil, true)
         if not path then
             return false, length
@@ -545,6 +771,12 @@ local pull_io = {
     disengage = function()
         send_input('/attackoff')
     end,
+    face = function(mob)
+        face(mob)
+    end,
+    rest = function(on)
+        fight_io.rest(on)
+    end,
     say = function(text)
         say('%s', text)
     end,
@@ -552,8 +784,15 @@ local pull_io = {
 
 local function stop_pulling(reason)
     if state.pull then
+        local st, p = state.stats, state.pull
+        if st and reason then
+            local hours = math.max((os.clock() - st.started) / 3600, 1 / 3600)
+            say('session: %d kills, %d pulls in %d min; %d EXP (%d/h)%s', p.kills, p.pulls,
+                math.floor((os.clock() - st.started) / 60), st.exp, math.floor(st.exp / hours),
+                (st.cp > 0 and string.format(', %d CP (%d/h)', st.cp, math.floor(st.cp / hours)) or ''))
+        end
         state.pull:stop()
-        state.pull = nil
+        state.pull, state.fighter = nil, nil
         state.pull_walk, state.pull_steering = false, false
         if reason then
             say('pulling stopped: %s', reason)
@@ -562,16 +801,25 @@ local function stop_pulling(reason)
 end
 
 local function pull_tick(pos)
-    local player = windower.ffxi.get_player()
+    new_tick()
+    local player = cached('player', windower.ffxi.get_player)
     if not player then
         return
     end
     local mob_me = windower.ffxi.get_mob_by_target('me')
+    local target = windower.ffxi.get_mob_by_target('t')
+    local v = player.vitals or {}
+    local party_names, party_size = trust_party()
     local r = state.pull:tick(os.clock(), {
         g = state.graph, pos = pos, status = player.status,
-        hpp = player.vitals and player.vitals.hpp or (mob_me and mob_me.hpp) or 100,
+        hpp = v.hpp or (mob_me and mob_me.hpp) or 100, mpp = v.mpp or 100, max_mp = v.max_mp or player.max_mp or 0, tp = v.tp or 0,
+        facing = mob_me and mob_me.facing,
         me = player.id, party = party_ids(), mobs = windower.ffxi.get_mob_array() or {},
+        target_id = target and target.id,
         blocked = active_blocks(),
+        buffs = buff_names(player), can = can_use, count = item_count,
+        -- party: ids for claims (above); trust names for the fighter
+        trust_party = party_names, party_size = party_size,
     })
     if r and r.stop then
         stop_pulling(r.stop)
@@ -771,9 +1019,18 @@ function commands.pull(sub, ...)
             say('stop recording first (//wp stop)')
             return
         end
-        local camp = state.graph.marks[(p.camp or ''):lower()]
-        if not camp then
-            say('set a camp first: //wp pull camp <mark>')
+        local camps = {}
+        for name in (p.camp or ''):gmatch('[^,]+') do
+            name = name:gsub('^%s+', ''):gsub('%s+$', ''):lower()
+            local node = state.graph.marks[name]
+            if node then
+                camps[#camps + 1] = {name = name, node = node}
+            elseif name ~= '' then
+                say('no mark "%s" in this zone; skipping it', name)
+            end
+        end
+        if #camps == 0 then
+            say('set a camp first: //wp pull camp <mark>[,<mark>...]')
             return
         end
         local player = windower.ffxi.get_player()
@@ -783,26 +1040,62 @@ function commands.pull(sub, ...)
         end
         stop_nav()
         local a = pull_action()
+        local f
+        if settings.fight.enabled then
+            local io_ = {}
+            for k, fn in pairs(fight_io) do io_[k] = fn end
+            io_.steer, io_.halt, io_.face = pull_io.steer, pull_io.halt, pull_io.face
+            local pr = load_profile(job_name())
+            f = fighter.new(io_, pr)
+            -- A buff name the game doesn't have would never show as up: say so.
+            local known = {}
+            for _, b in pairs(names().buffs) do known[b] = true end
+            if next(known) then
+                for _, b in ipairs(f.p.buff_uses) do
+                    if not known[b.buff] then
+                        say('profile: no buff called "%s" (for %s); set buff = "<name>" in %s', b.buff, b.use.name,
+                            profile_path(job_name()))
+                    end
+                end
+            end
+        end
+        state.fighter = f
+        state.stats = {started = os.clock(), exp = 0, cp = 0}
         state.pull = puller.new(pull_io, {
             range = a.range, engages = a.engages, snap = p.snap, max_dz = p.max_dz, max_route = p.radius,
             claim_wait = p.claim_wait, engage_range = p.engage_range, max_aggro = p.max_aggro,
             min_hp = p.min_hp, max_pulls = p.max_pulls, max_minutes = p.max_minutes,
+            crowd_radius = p.crowd_radius, roam_after = p.roam_after,
             camp_radius = settings.nav.tolerance * 2,
-        })
-        state.pull:start(camp, pull_names(), os.clock())
-        say('pulling from "%s": %s within %.0f yalms by the routes, with %s (//wp pull off or Escape stops)',
-            p.camp, p.names ~= '' and p.names or 'any monster', p.radius, a.command)
+        }, nil, f)
+        state.pull:start(camps, pull_names(), os.clock())
+        say('pulling from "%s": %s within %.0f yalms by the routes, with %s; fighting %s (//wp pull off or Escape stops)',
+            p.camp, p.names ~= '' and p.names or 'any monster', p.radius, a.command,
+            f and ('with the ' .. job_name() .. ' profile') or 'by hand')
     elseif sub == 'off' then
         if state.pull then stop_pulling('by request') else say('not pulling') end
+    elseif sub == 'pause' or sub == 'resume' then
+        if not state.pull then say('not pulling') return end
+        state.pull:pause(sub == 'pause')
+        say(sub == 'pause' and 'paused: finishing any fight, then waiting at camp (//wp pull resume)' or 'resumed')
     elseif sub == 'camp' then
-        local name = rest:lower()
-        if name == '' or not state.graph.marks[name] then
-            say('usage: //wp pull camp <mark> (//wp marks lists them)')
+        -- One mark, or several separated by commas to move between when one runs dry.
+        local list = {}
+        for name in rest:lower():gmatch('[^,]+') do
+            name = name:gsub('^%s+', ''):gsub('%s+$', '')
+            if not state.graph.marks[name] then
+                say('no mark "%s" (//wp marks lists them)', name)
+                return
+            end
+            list[#list + 1] = name
+        end
+        if #list == 0 then
+            say('usage: //wp pull camp <mark>[,<mark>...]')
             return
         end
-        p.camp = name
+        p.camp = table.concat(list, ',')
         config.save(settings)
-        say('camp: "%s"', name)
+        say('camp%s: %s', #list > 1 and 's (moving on when one runs dry)' or '', p.camp)
     elseif sub == 'add' or sub == 'remove' then
         local name = rest:lower()
         if name == '' then
@@ -855,6 +1148,125 @@ function commands.pull(sub, ...)
         say('pull: %s; camp "%s"; targets %s; %s (range %.1f); radius %.0f', state.pull and state.pull.state or 'off',
             p.camp, p.names ~= '' and p.names or 'any monster', a.command, a.range, p.radius)
     end
+end
+
+-- //wp fight: the job's fight profile.
+local function describe_profile(job, pr)
+    local n = fighter.normalize(pr)
+    local function uses(list)
+        local out = {}
+        for _, u in ipairs(list) do out[#out + 1] = u end
+        return #out > 0 and table.concat(out, ', ') or 'none'
+    end
+    local buffs, heals = {}, {}
+    for _, b in ipairs(pr.buffs or {}) do buffs[#buffs + 1] = tostring(b.use) .. (b.when and (' (' .. b.when .. ')') or '') end
+    for _, h in ipairs(pr.heals or {}) do heals[#heals + 1] = string.format('%s <%d%%', tostring(h.use), h.hpp or 50) end
+    say('%s fight profile (%s)%s:', job, profile_path(job), settings.fight.enabled and '' or ' [off: //wp fight on]')
+    say('  weaponskill: %s', n.weaponskill and string.format('%s at %d TP', n.weaponskill.name, n.weaponskill.tp) or 'none')
+    say('  open: %s;  buffs: %s', uses(pr.open or {}), uses(buffs))
+    say('  heals: %s', uses(heals))
+    say('  rest below %d%% HP / %d%% MP until %d%% / %d%%;  reach %.1f', n.rest.hpp, n.rest.mpp, n.rest.until_hpp,
+        n.rest.until_mpp, n.reach)
+    say('  trusts: %s;  food: %s;  ring: %s', uses(pr.trusts or {}), pr.food or 'none',
+        n.ring and string.format('%s (%s)', n.ring.name, n.ring.buff) or 'none')
+end
+
+local function remove_use(list, text)
+    local key = text:lower()
+    for i = #list, 1, -1 do
+        local u = list[i]
+        local s_ = type(u) == 'table' and tostring(u.use) or tostring(u)
+        if s_:lower() == key or s_:lower():match(':(.+)$') == key then table.remove(list, i) end
+    end
+end
+
+function commands.fight(sub, ...)
+    sub = (sub or ''):lower()
+    local args = {...}
+    local rest = table.concat(args, ' ')
+    local job = job_name()
+    local pr = load_profile(job)
+    local changed = true
+    if sub == 'on' or sub == 'off' then
+        settings.fight.enabled = sub == 'on'
+        config.save(settings)
+        say('fighting with the profile: %s (takes effect at the next //wp pull on)', sub)
+        return
+    elseif sub == 'ws' then
+        local tp = tonumber(args[#args])
+        if tp then table.remove(args) end
+        local name = table.concat(args, ' ')
+        if name == '' or name:lower() == 'off' then pr.weaponskill = nil
+        else pr.weaponskill = {name = name, tp = tp or 1000} end
+    elseif sub == 'trust' or sub == 'trusts' then
+        local verb = (args[1] or ''):lower()
+        table.remove(args, 1)
+        local name = table.concat(args, ' ')
+        pr.trusts = pr.trusts or {}
+        if verb == 'add' and name ~= '' then pr.trusts[#pr.trusts + 1] = name
+        elseif verb == 'remove' and name ~= '' then remove_use(pr.trusts, name)
+        elseif verb == 'clear' then pr.trusts = {}
+        else say('usage: //wp fight trust add|remove <name> | trust clear') return end
+    elseif sub == 'food' then
+        pr.food = (rest ~= '' and rest:lower() ~= 'off') and rest or nil
+    elseif sub == 'ring' then
+        if rest == '' or rest:lower() == 'off' then pr.ring = nil
+        else
+            local buff = rest:lower():find('trizek') or rest:lower():find('capacity') or rest:lower():find('endorsement')
+            pr.ring = {name = rest, buff = buff and 'Commitment' or 'Dedication'}
+        end
+    elseif sub == 'rest' then
+        local hpp, mpp = tonumber(args[1]), tonumber(args[2])
+        if not hpp then say('usage: //wp fight rest <HP%> [MP%]') return end
+        pr.rest = pr.rest or {}
+        pr.rest.hpp, pr.rest.mpp = hpp, mpp or pr.rest.mpp
+    elseif sub == 'reach' then
+        local n = tonumber(rest)
+        if not n then say('usage: //wp fight reach <yalms>') return end
+        pr.reach = n
+    elseif sub == 'add' then
+        local list = (args[1] or ''):lower()
+        table.remove(args, 1)
+        if list == 'open' then
+            local use = table.concat(args, ' ')
+            if use == '' then say('usage: //wp fight add open ja:<ability>') return end
+            pr.open = pr.open or {}
+            pr.open[#pr.open + 1] = use
+        elseif list == 'buff' then
+            local use = table.concat(args, ' ')
+            if use == '' then say('usage: //wp fight add buff ma:<spell> | ja:<ability> | item:<item>') return end
+            pr.buffs = pr.buffs or {}
+            pr.buffs[#pr.buffs + 1] = {use = use}
+        elseif list == 'heal' then
+            local hpp = tonumber(args[#args])
+            if hpp then table.remove(args) end
+            local use = table.concat(args, ' ')
+            if use == '' then say('usage: //wp fight add heal ma:<spell> | item:<item> | ja:<ability> <HP%>') return end
+            pr.heals = pr.heals or {}
+            pr.heals[#pr.heals + 1] = {use = use, hpp = hpp or 50}
+        else
+            say('usage: //wp fight add open|buff|heal <use> (use: ja:Name, ma:Name, item:Name)')
+            return
+        end
+    elseif sub == 'remove' then
+        local list = (args[1] or ''):lower()
+        table.remove(args, 1)
+        local key = ({open = 'open', buff = 'buffs', heal = 'heals'})[list]
+        if not key then say('usage: //wp fight remove open|buff|heal <use>') return end
+        remove_use(pr[key] or {}, table.concat(args, ' '))
+    elseif sub == 'clear' then
+        local key = ({open = 'open', buffs = 'buffs', buff = 'buffs', heals = 'heals', heal = 'heals',
+                      trusts = 'trusts'})[(args[1] or ''):lower()]
+        if not key then say('usage: //wp fight clear open|buffs|heals|trusts') return end
+        pr[key] = {}
+    else
+        changed = false
+    end
+    if changed then
+        save_profile(job, pr)
+        if state.fighter then state.fighter:set_profile(pr) end
+    end
+    describe_profile(job, pr)
 end
 
 function commands.info()
@@ -955,7 +1367,9 @@ function commands.help()
         '//wp doors [on|off]            open closed doors on the way',
         '//wp pull camp <mark> | add <mob> | remove <mob> | clear | radius <yalms>',
         '//wp pull action ra|provoke|dia|melee | custom <command> <range>',
-        '//wp pull on | off             pull to the camp along the routes',
+        '//wp pull on | off | pause | resume   pull to the camp along the routes',
+        '//wp fight                     the job\'s fight profile; ws <name> [tp], trust add <name>,',
+        '                               food <item>, ring <item>, rest <HP%> [MP%], add open|buff|heal ...',
         '//wp blocked | unblock         paths found blocked while walking (kept 10 min)',
         '//wp info | save | reload | clear confirm | show | hide',
     }) do
@@ -1016,11 +1430,58 @@ windower.register_event('action', function(act)
     for _, t in ipairs(act.targets or {}) do
         ids[#ids + 1] = t.id
     end
+    -- Only actions involving the party matter.
+    local party = party_ids()
+    local involved = party[act.actor_id]
+    for _, id in ipairs(ids) do involved = involved or party[id] end
+    if not involved then
+        return
+    end
     local function monster(id)
         local m = windower.ffxi.get_mob_by_id(id)
         return m ~= nil and m.spawn_type == 16
     end
-    state.pull:on_action(act.actor_id, ids, monster(act.actor_id), party_ids(), monster)
+    state.pull:on_action(act.actor_id, ids, monster(act.actor_id), party, monster)
+    local player = windower.ffxi.get_player()
+    if state.fighter and player and act.actor_id == player.id then
+        state.fighter:on_self_action(act.category, act.param, os.clock())
+    end
+end)
+
+-- A tell (or a GM) while pulling: stop and let the player answer.
+windower.register_event('chat message', function(message, sender, mode, gm)
+    if state.pull and (mode == 3 or gm) then
+        stop_pulling(string.format('%s from %s', gm and 'message' or 'tell', tostring(sender)))
+    end
+end)
+
+-- The game's refusals of a pull, so a bad pull is dropped at once instead of timing out.
+local PULL_ERRORS = {'unable to see', 'cannot see', 'too far away', 'out of range', 'appropriate ranged weapon',
+                     'no ammunition', 'cannot attack', 'unable to use', 'not enough tp', 'cannot use that',
+                     'is not in range'}
+
+-- Experience and capacity points while pulling, for the session summary and the overlay.
+windower.register_event('incoming text', function(original)
+    local st = state.stats
+    if not state.pull or not st or type(original) ~= 'string' then
+        return
+    end
+    local lower = original:lower()
+    for _, e in ipairs(PULL_ERRORS) do
+        if lower:find(e, 1, true) then
+            state.pull:on_pull_error(original:gsub('[%c]', ''):sub(1, 80))
+            break
+        end
+    end
+    local player = windower.ffxi.get_player()
+    local me_name = player and player.name
+    if not me_name or not original:find(me_name, 1, true) then
+        return
+    end
+    local exp = original:match('(%d+) experience points') or original:match('(%d+) limit points')
+    local cp = original:match('(%d+) capacity points')
+    if exp then st.exp = st.exp + tonumber(exp) end
+    if cp then st.cp = st.cp + tonumber(cp) end
 end)
 
 -- While recording, a door you open by hand is remembered for this zone, so it is opened

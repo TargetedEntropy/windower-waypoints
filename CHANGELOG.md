@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0 (2026-11-20)
+
+- **Fighting** (`//wp fight`), with a profile per job in `data/fight/<JOB>.lua`.
+  - **In a fight:** heals by HP%, closes to melee reach and faces the mob, openers once per
+    fight, fight buffs, and a weaponskill at a TP threshold.
+  - **At camp:** food, an EXP/CP ring (equip, wait, use), Trust NPCs, camp buffs, and
+    resting below HP/MP thresholds.
+  - Usability (known, recast, MP/TP, silence, amnesia, sleep, stun) is read from
+    Windower. Nothing is sent mid-cast, and commands are spaced.
+- **Pulling**
+  - Lone mobs are preferred over crowded ones (links).
+  - Several camps: `//wp pull camp a,b,c` moves on when one runs dry.
+  - `//wp pull pause` / `resume`.
+  - Refused pulls are dropped at once; three failures in a row stop it.
+  - A tell stops it. A session summary reports kills and EXP/CP per hour, and the overlay
+    shows them live.
+  - Limits and too many mobs stop it after the fight, not in the middle of one.
+- **Fixes from review**
+  - A mob stolen mid-fight is let go instead of chased until the 3-minute timeout.
+  - It stays on one opponent instead of flipping between two (which restarted openers and
+    the fight timer).
+  - `/attackoff` isn't repeated every tick while the server clears your status.
+  - Steering stops when a fight ends.
+  - Each mob gets its full pull retries.
+  - A camp node the walk can't reach exactly no longer loops.
+  - The fight timeout disengages.
+  - Game state is read once per tick.
+- Tests: 180 offline checks.
+
 ## 0.4.0 (2026-11-20)
 
 - **Pulling** (`//wp pull`). It pulls monsters to a camp mark along the recorded routes.

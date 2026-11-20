@@ -352,7 +352,7 @@ local function pull_world(opts)
         end
     end
     function io.engage(m) w.status, w.engaged, w.engaged_at = 1, m, w.t end
-    function io.disengage() w.status = 0 end
+    function io.disengage() w.disengages = (w.disengages or 0) + 1 if not opts.sticky_engage then w.status = 0 end end
     function io.say(text) w.said[#w.said + 1] = text end
     w.p = puller.new(io, opts.puller or {}, function() return 0.5 end)
     w.p:start(ids[1], opts.names, 0)
@@ -465,9 +465,17 @@ do
     -- Stops: too many mobs, low HP, death.
     local a, b, c = M(1002, 'Crab', 1, 1), M(1003, 'Crab', 1, 2), M(1004, 'Crab', 2, 1)
     local w = pull_world({mobs = {a, b, c}})
-    for _, m in ipairs({a, b, c}) do w.p:on_action(m.id, {7}, true, {[7] = true}) end
+    for _, m in ipairs({a, b, c}) do
+        m.claim_id = 7
+        w.p:on_action(m.id, {7}, true, {[7] = true})
+    end
     w.run(0.2)
-    check('puller: stops with too many mobs', w.stopped == '3 mobs on you' and not w.p:running(), w.stopped)
+    check('puller: too many mobs: warns, keeps fighting', w.said_like('3 mobs on you: stopping after this fight')
+        and w.p:running() and w.p.state == 'fighting', w.p.state)
+    w.run(30)
+    check('puller: then stops once they are dead', w.stopped == '3 mobs on you' and a.hpp + b.hpp + c.hpp == 0,
+        tostring(w.stopped))
+    check('puller: counts the kills', w.p.kills == 3, w.p.kills)
 
     w = pull_world({mobs = {}})
     w.hpp = 30
@@ -493,6 +501,265 @@ do
     check('puller: then goes back to pulling', crab.hpp == 0)
 end
 
+do
+    -- Lone mobs first: a crab with two others beside it costs 40 yalms more.
+    local g, ids = u_graph()
+    local crowded = M(1002, 'Crab', 20, -4)
+    local friends = {M(1003, 'Bat', 22, -6), M(1004, 'Bat', 18, -6)}
+    local lone = M(1005, 'Crab', 20, 16)       -- farther: 36 by the routes
+    local mobs = {crowded, friends[1], friends[2], lone}
+    local pick = targets.pick(g, ids[1], mobs, {max_route = 80, party = {}, names = {crab = true},
+                                                crowd_radius = 8, crowd_penalty = 20})
+    check('targets: avoids a crowded mob', pick and pick.mob.id == 1005, pick and pick.mob.id)
+    pick = targets.pick(g, ids[1], mobs, {max_route = 80, party = {}, names = {crab = true}})
+    check('targets: crowd check off by default', pick and pick.mob.id == 1002, pick and pick.mob.id)
+end
+
+do
+    -- A refused pull ("Unable to see") is dropped at once; three failures in a row stop.
+    local a, b, c = M(1002, 'Crab', 20, -6), M(1003, 'Crab', 20, 6), M(1004, 'Crab', 20, 12)
+    local w = pull_world({mobs = {a, b, c}, unpullable = {[1002] = true, [1003] = true, [1004] = true},
+                          puller = {range = 10}})
+    for _ = 1, 200 do
+        if w.pulls > 0 then break end
+        w.run(0.1)
+    end
+    w.p:on_pull_error('Unable to see the Crab.')
+    w.run(0.2)
+    check('puller: a refused pull is dropped at once', w.pulls == 1 and w.said_like('skipping Crab for 60s: Unable to see'),
+        w.said[#w.said])
+    w.run(120)
+    check('puller: three failures in a row stop it', w.stopped and w.stopped:find('3 pulls in a row failed'), w.stopped)
+end
+
+do
+    -- Two camps: the first runs dry, so it moves to the second and pulls there.
+    local g, ids = u_graph()
+    local crab = M(1002, 'Crab', 2, 24)          -- only near the far end of the route
+    local w = pull_world({mobs = {crab}, puller = {range = 8, max_route = 20, roam_after = 10}})
+    w.p:start({{name = 'east', node = w.ids[1]}, {name = 'west', node = w.ids[#w.ids]}}, nil, 0)
+    w.run(15)
+    check('puller: moves to the next camp when one runs dry', w.said_like('moving to camp "west"'), w.said[#w.said])
+    w.run(60)
+    check('puller: pulls at the new camp', crab.hpp == 0, w.p.state)
+end
+
+do
+    -- Pause: no new pulls; resume picks up again.
+    local crab = M(1002, 'Crab', 20, -6)
+    local w = pull_world({mobs = {crab}, puller = {range = 10}})
+    w.p:pause(true)
+    w.run(20)
+    check('puller: paused, no pulls', w.pulls == 0 and w.p.state == 'camp')
+    w.p:pause(false)
+    w.run(30)
+    check('puller: resumed', crab.hpp == 0)
+end
+
+do
+    -- Review fixes. A claim stolen mid-fight: "lost", disengage, no 180 s timeout.
+    local crab = M(1002, 'Crab', 20, -6)
+    local w = pull_world({mobs = {crab}, puller = {range = 10}, fight = 1000})
+    for _ = 1, 400 do
+        if w.status == 1 then break end
+        w.run(0.1)
+    end
+    check('review: engaged at camp', w.status == 1)
+    crab.claim_id = 99
+    w.run(1)
+    check('review: a stolen mob is lost, not fought', w.said_like('lost Crab to someone else') and w.disengages == 1,
+        w.said[#w.said])
+    w.run(5)
+    check('review: and the aggro is dropped', w.p:aggro_count() == 0 and not w.stopped)
+
+    -- Two adds at nearly the same distance: stays on the one it's fighting.
+    local a, b = M(1003, 'Bat', 1.5, 0), M(1004, 'Bat', 0, 1.6)
+    w = pull_world({mobs = {a, b}, fight = 1000})
+    for _, m in ipairs({a, b}) do m.claim_id = 7 w.p:on_action(m.id, {7}, true, {[7] = true}) end
+    w.run(2)
+    local first = w.p.fight_id
+    a.x, b.y = 0, 1.2                            -- b is now the nearer
+    a.y = 1.5
+    w.run(2)
+    check('review: sticks with its opponent', first and w.p.fight_id == first, tostring(w.p.fight_id))
+
+    -- A fight that ends while the server still shows you engaged: one /attackoff per 3 s.
+    local c = M(1005, 'Crab', 1, 1)
+    w = pull_world({mobs = {c}, fight = 2, sticky_engage = true})
+    c.claim_id = 7
+    w.p:on_action(c.id, {7}, true, {[7] = true})
+    w.run(3)
+    c.hpp, c.status = 0, 2
+    w.status = 1                                 -- stays engaged: the server is slow
+    w.run(4)
+    check('review: no /attackoff flood', w.disengages and w.disengages <= 2, w.disengages)
+end
+
+-- fighter ------------------------------------------------------------------------------------
+
+local fighter = require('fighter')
+
+local function fight_rig(profile, view_over)
+    local r = {used = {}, steered = 0, halted = 0, faced = 0, rest = {}, equipped = {}, said = {}}
+    local io = {
+        use = function(kind, name, target) r.used[#r.used + 1] = kind .. ':' .. name .. '>' .. (type(target) == 'table' and target.id or target) end,
+        steer = function() r.steered = r.steered + 1 end,
+        halt = function() r.halted = r.halted + 1 end,
+        face = function() r.faced = r.faced + 1 end,
+        rest = function(on) r.rest[#r.rest + 1] = on end,
+        equip = function(slot, name) r.equipped[#r.equipped + 1] = slot .. '=' .. name end,
+        say = function(t) r.said[#r.said + 1] = t end,
+    }
+    r.ready = {}          -- 'kind:name' -> true when usable
+    r.items = {}
+    r.view = {pos = P(0, 0), facing = 0, status = 0, hpp = 100, mpp = 100, max_mp = 100, tp = 0, buffs = {},
+              trust_party = {}, party_size = 1,
+              can = function(kind, name) return r.ready[kind .. ':' .. name] == true, {cast = 2} end,
+              count = function(item) return r.items[item] or 0 end}
+    for k, v in pairs(view_over or {}) do r.view[k] = v end
+    r.f = fighter.new(io, profile, function() return 0.5 end)
+    r.last = function() return r.used[#r.used] end
+    return r
+end
+
+do
+    check('fighter: parse ja', fighter.parse_use('ja:Berserk').kind == 'ja' and fighter.parse_use('ja:Berserk').name == 'Berserk')
+    check('fighter: bare name is a spell', fighter.parse_use('Cure II').kind == 'ma')
+    check('fighter: trust names', fighter.trust_key('Shantotto II') == 'shantotto' and fighter.trust_key('Kupipi (UC)') == 'kupipi')
+
+    -- 1. Range and facing.
+    local mob = {id = 50, x = 10, y = 0, z = 0, hpp = 100}
+    local r = fight_rig({})
+    r.f:fight(0, r.view, mob)
+    check('fighter: runs in to melee reach', r.steered == 1 and #r.used == 0)
+    mob.x, mob.y = 2, 2                          -- in reach, 45 degrees off our facing of 0
+    r.view.facing = 0
+    r.f:fight(1, r.view, mob)
+    check('fighter: faces a mob it is turned away from', r.faced == 1 and r.halted >= 1)
+    r.view.facing = -math.atan2(2, 2)
+    r.f:fight(2, r.view, mob)
+    check('fighter: no turning when already facing', r.faced == 1)
+
+    -- 2. Weaponskill at TP, not on an almost-dead mob.
+    r = fight_rig({weaponskill = {name = 'Raging Axe', tp = 1000}})
+    mob = {id = 50, x = 1, y = 0, z = 0, hpp = 100}
+    r.ready['ws:Raging Axe'] = true
+    r.view.tp = 900
+    r.f:fight(0, r.view, mob)
+    check('fighter: no weaponskill below TP', #r.used == 0)
+    r.view.tp = 1000
+    r.f:fight(1, r.view, mob)
+    check('fighter: weaponskill at TP', r.last() == 'ws:Raging Axe>50', r.last())
+    r.f:fight(1.5, r.view, mob)
+    check('fighter: spaced, not spammed', #r.used == 1)
+    mob.hpp = 3
+    r.f:fight(10, r.view, mob)
+    check('fighter: no weaponskill on a nearly dead mob', #r.used == 1)
+
+    -- 3. Openers once per fight; fight buffs when missing.
+    r = fight_rig({open = {'ja:Berserk'}, buffs = {{use = 'ja:Warcry', buff = 'Warcry'}}})
+    mob = {id = 50, x = 1, y = 0, z = 0, hpp = 100}
+    r.ready['ja:Berserk'], r.ready['ja:Warcry'] = true, true
+    r.f:fight(0, r.view, mob)
+    check('fighter: opener first', r.last() == 'ja:Berserk>me', r.last())
+    r.f:fight(5, r.view, mob)
+    check('fighter: then a missing fight buff', r.last() == 'ja:Warcry>me', r.last())
+    r.view.buffs = {warcry = true}
+    r.f:fight(10, r.view, mob)
+    check('fighter: opener not repeated in the fight', #r.used == 2)
+    r.f:reset_fight()
+    r.f:fight(15, r.view, mob)
+    check('fighter: opener again next fight', r.last() == 'ja:Berserk>me' and #r.used == 3)
+
+    -- 5. Heals come first, and stop movement.
+    r = fight_rig({heals = {{use = 'ma:Cure II', hpp = 50}, {use = 'item:Hi-Potion', hpp = 35}},
+                   weaponskill = {name = 'Raging Axe'}})
+    mob = {id = 50, x = 8, y = 0, z = 0, hpp = 100}
+    r.ready['ma:Cure II'], r.ready['ws:Raging Axe'] = true, true
+    r.view.hpp, r.view.tp = 45, 1500
+    r.f:fight(0, r.view, mob)
+    check('fighter: heals first, standing still', r.last() == 'ma:Cure II>me' and r.halted == 1 and r.steered == 0, r.last())
+    r.f:fight(2, r.view, mob)
+    check('fighter: nothing while casting', #r.used == 1)
+    r.f:on_self_action(4, 0, 4)
+    r.ready['ma:Cure II'] = false
+    r.ready['item:Hi-Potion'] = true
+    r.view.hpp = 30
+    r.f:fight(8, r.view, mob)
+    check('fighter: next heal when the first is not ready', r.last() == 'item:Hi-Potion>me', r.last())
+
+    -- 4. Rest at camp, and get up when recovered.
+    r = fight_rig({})
+    r.view.hpp = 50
+    check('fighter: not ready at low HP', r.f:prepare(0, r.view) == false and r.rest[1] == true)
+    r.view.status, r.view.hpp = 33, 90
+    check('fighter: keeps resting', r.f:prepare(5, r.view) == false and #r.rest == 1)
+    r.view.hpp = 96
+    r.f:prepare(10, r.view)
+    check('fighter: gets up when recovered', r.rest[2] == false)
+    r.view.status = 0
+    check('fighter: then ready', r.f:prepare(20, r.view) == true)
+    r.view.mpp, r.view.max_mp = 10, 0
+    check('fighter: MP ignored without MP', r.f:prepare(30, r.view) == true)
+
+    -- 6. Trusts: called when missing, given up on for a while after two failures.
+    r = fight_rig({trusts = {'Kupipi', 'Valaineral'}})
+    r.ready['ma:Kupipi'], r.ready['ma:Valaineral'] = true, true
+    check('fighter: calls a missing Trust', r.f:prepare(0, r.view) == false and r.last() == 'ma:Kupipi>me', r.last())
+    r.view.trust_party = {kupipi = true}
+    r.view.party_size = 2
+    r.f:prepare(10, r.view)
+    check('fighter: then the next', r.last() == 'ma:Valaineral>me', r.last())
+    r.f:prepare(20, r.view)
+    check('fighter: retries one that did not join', r.last() == 'ma:Valaineral>me' and #r.used == 3)
+    check('fighter: then leaves it for a while', r.f:prepare(30, r.view) == true and #r.used == 3)
+    r.view.party_size = 6
+    r.view.trust_party = {}
+    check('fighter: no Trust into a full party', r.f:prepare(40, r.view) == true)
+
+    -- 7. Food and the EXP ring.
+    r = fight_rig({food = 'Grape Daifuku', ring = {name = 'Echad Ring', buff = 'Dedication', delay = 8}})
+    r.items['Grape Daifuku'], r.items['Echad Ring'] = 3, 1
+    r.f:prepare(0, r.view)
+    check('fighter: eats', r.last() == 'item:Grape Daifuku>me', r.last())
+    r.view.buffs = {food = true}
+    r.f:prepare(10, r.view)
+    check('fighter: equips the ring', r.equipped[1] == 'ring1=Echad Ring' and #r.used == 1)
+    r.f:prepare(12, r.view)
+    check('fighter: waits out the equip delay', #r.used == 1)
+    r.f:prepare(19, r.view)
+    check('fighter: then uses it', r.last() == 'item:Echad Ring>me', r.last())
+    r.view.buffs = {food = true}
+    check('fighter: ring on recast is left alone', r.f:prepare(40, r.view) == true and #r.equipped == 1)
+
+    -- Camp buffs (spells) vs fight buffs (abilities).
+    r = fight_rig({buffs = {{use = 'ma:Protect', buff = 'Protect'}, {use = 'ja:Warcry', buff = 'Warcry'}}})
+    r.ready['ma:Protect'], r.ready['ja:Warcry'] = true, true
+    r.f:prepare(0, r.view)
+    check('fighter: camp buff at camp', r.last() == 'ma:Protect>me', r.last())
+    r.view.buffs = {protect = true}
+    check('fighter: no fight buff at camp', r.f:prepare(10, r.view) == true and #r.used == 1)
+end
+
+do
+    -- The puller with a fighter: rests before pulling, and the fighter runs the fight.
+    local crab = M(1002, 'Crab', 20, -6)
+    local uses = {}
+    local fio = {use = function(k, n) uses[#uses + 1] = k .. ':' .. n end, steer = function() end, halt = function() end,
+                 face = function() end, rest = function(on) uses[#uses + 1] = 'rest:' .. tostring(on) end,
+                 equip = function() end, say = function() end}
+    local f = fighter.new(fio, {weaponskill = {name = 'Raging Axe'}}, function() return 0.5 end)
+    local w = pull_world({mobs = {crab}, puller = {range = 10}})
+    w.p = puller.new(w.p.io, {range = 10}, function() return 0.5 end, f)
+    w.p:start(w.ids[1], nil, 0)
+    w.hpp = 50
+    w.run(3)
+    check('puller+fighter: rests instead of pulling at low HP', uses[1] == 'rest:true' and w.pulls == 0)
+    w.hpp = 100
+    w.run(40)
+    check('puller+fighter: pulls once rested', w.pulls >= 1 and crab.hpp == 0)
+end
+
 -- addon sessions ------------------------------------------------------------------------------
 
 -- Loads waypoints.lua into a fake Windower. `world.blocked(x0, y0, x1, y1)` says whether a
@@ -516,7 +783,9 @@ local function session(world)
         end}
     end
     package.preload['resources'] = function()
-        return {zones = {[230] = {name = 'Southern San d\'Oria'}}}
+        local r = {zones = {[230] = {name = 'Southern San d\'Oria'}}}
+        for k, v in pairs(world.res or {}) do r[k] = v end
+        return r
     end
     package.preload['packets'] = function()
         return {
@@ -548,8 +817,16 @@ local function session(world)
         create_dir = function(p) return os.execute('mkdir "' .. p .. '"') == 0 end,
         ffxi = {
             get_mob_by_target = function() return {x = env.player.x, y = env.player.y, z = env.player.z} end,
-            get_player = function() return {id = 1, status = env.player.status, target_locked = false,
-                                            vitals = {hpp = env.player.hpp or 100}} end,
+            get_player = function() return {id = 1, name = 'Galley', main_job = env.player.job or 'WAR',
+                                            status = env.player.status, target_locked = false,
+                                            buffs = env.player.buffs or {},
+                                            vitals = {hpp = env.player.hpp or 100, tp = env.player.tp or 0,
+                                                      mpp = 100, max_mp = 0}} end,
+            get_abilities = function() return world.abilities or {job_abilities = {}, weapon_skills = {}} end,
+            get_ability_recasts = function() return {} end,
+            get_spell_recasts = function() return {} end,
+            get_spells = function() return {} end,
+            get_items = function(bag) return (world.bags or {})[bag] or {} end,
             get_party = function() return {p0 = {mob = {id = 1}}} end,
             get_mob_by_id = function(id)
                 for _, m in ipairs(world.mobs or {}) do if m.id == id then return m end end
@@ -799,6 +1076,64 @@ do
     check('pull: //wp go waits', s.said('stop pulling first'))
     s.cmd('stop')
     check('pull: //wp stop stops it', s.said('pulling stopped: by request'), s.chat[#s.chat])
+    s.close()
+end
+
+-- Fighting in a whole session: a profile set by commands and saved per job; food at camp
+-- before the first pull; a weaponskill at 1000 TP.
+do
+    local crab = {id = 1002, index = 2, name = 'Ghost Crab', x = 24, y = 18, z = 0, hpp = 100, spawn_type = 16,
+                  status = 0, claim_id = 0, valid_target = true}
+    local world = {mobs = {crab},
+                   res = {weapon_skills = {[1] = {id = 1, en = 'Raging Axe'}},
+                          items = {[4271] = {id = 4271, en = 'Grape Daifuku'}},
+                          buffs = {[251] = {id = 251, en = 'Food'}}},
+                   abilities = {job_abilities = {}, weapon_skills = {1}},
+                   bags = {[0] = {{id = 4271, count = 2}}}}
+    function world.command(env, c)
+        if c == 'input /item "Grape Daifuku" <me>' then env.player.buffs = {251} end
+        if c == 'input /ra 1002' then crab.claim_id, crab.status = 1, 1 end
+        if c == 'input /attack 1002' then env.player.status, env.player.tp = 1, 1000 end
+        if c == 'input /ws "Raging Axe" 1002' then
+            env.player.tp, crab.hpp, crab.status, env.player.status = 0, 0, 2, 0
+        end
+    end
+    function world.tick(env)
+        local p = env.player
+        if crab.claim_id == 1 and crab.hpp > 0 then
+            local dx, dy = p.x - crab.x, p.y - crab.y
+            local d = math.sqrt(dx * dx + dy * dy)
+            if d > 1.5 then crab.x, crab.y = crab.x + dx / d * 0.4, crab.y + dy / d * 0.4 end
+            env.events['action']({actor_id = 1002, targets = {{id = 1}}})
+        end
+    end
+    local s = session(world)
+    s.cmd('rec')
+    s.cmd('mark', 'camp')
+    s.walk_to(20, 0)
+    s.walk_to(20, 20)
+    s.cmd('stop')
+    s.walk_to(0, 0)
+    s.cmd('fight', 'ws', 'Raging', 'Axe', '1000')
+    s.cmd('fight', 'food', 'Grape', 'Daifuku')
+    s.cmd('fight', 'trust', 'add', 'Kupipi')
+    check('fight: profile saved per job', windower.file_exists(s.dir .. 'data/fight/WAR.lua'))
+    check('fight: profile shown', s.said('weaponskill: Raging Axe at 1000 TP'), s.chat[#s.chat])
+    s.cmd('fight', 'trust', 'remove', 'Kupipi')
+    s.cmd('fight')
+    check('fight: profile reloads from the file', s.said('trusts: none;  food: Grape Daifuku'), s.chat[#s.chat])
+    s.cmd('pull', 'camp', 'camp')
+    s.cmd('pull', 'on')
+    check('fight: pulling with the profile', s.said('fighting with the WAR profile'), s.chat[#s.chat])
+    check('fight: eats before pulling', s.drive('eating Grape Daifuku', 100), s.chat[#s.chat])
+    check('fight: then pulls', s.drive('pulling Ghost Crab', 200), s.chat[#s.chat])
+    check('fight: weaponskill finishes it', s.drive('Ghost Crab defeated', 800), s.chat[#s.chat])
+    local ws = false
+    for _, c in ipairs(s.sent) do if c == 'input /ws "Raging Axe" 1002' then ws = true end end
+    check('fight: sent the weaponskill at the crab', ws)
+    s.events['chat message']('hi', 'Someone', 3, false)
+    check('fight: a tell stops pulling', s.said('pulling stopped: tell from Someone'), s.chat[#s.chat])
+    check('fight: session summary', s.said('session: 1 kills, 1 pulls'), s.chat[#s.chat - 1])
     s.close()
 end
 
